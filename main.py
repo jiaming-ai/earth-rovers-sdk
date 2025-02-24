@@ -196,6 +196,7 @@ async def retrieve_tokens(headers, bot_slug):
     response = requests.post(
         FRODOBOTS_API_URL + "/sdk/token", headers=headers, json=data, timeout=15
     )
+    print(response.json(), data)
 
     if response.status_code != 200:
         raise HTTPException(
@@ -210,6 +211,15 @@ async def need_start_mission():
         return
     if auth_response_data:
         return
+
+    # if the mission is not started, return the start mission page
+    mission_slug = os.getenv("MISSION_SLUG")
+    if not mission_slug or not auth_response_data:
+        # Return the start mission page
+        with open("static/start-mission.html", "r", encoding="utf-8") as file:
+            html_content = file.read()
+        return HTMLResponse(content=html_content, status_code=200)
+
     raise HTTPException(
         status_code=400, detail="Call /start-mission endpoint to start a mission"
     )
@@ -332,13 +342,10 @@ async def end_mission():
 
 
 async def render_index_html(is_spectator: bool):
-    # Check if mission is active
-    mission_slug = os.getenv("MISSION_SLUG")
-    if not mission_slug or not auth_response_data:
-        # Return the start mission page
-        with open("static/start-mission.html", "r", encoding="utf-8") as file:
-            html_content = file.read()
-        return HTMLResponse(content=html_content, status_code=200)
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+
 
     token_type: Literal["SPECTATOR_", ""] = "SPECTATOR_" if is_spectator else ""
     
