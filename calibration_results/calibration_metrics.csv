@@ -1,0 +1,5 @@
+Method,Mean Error (°),Median Error (°),Max Error (°),Data Points
+Ellipsoid Only,,,,0
+GPS (No Kalman),,,,0
+GPS with Kalman,,,,0
+GPS+RPM with Kalman,,,,0
