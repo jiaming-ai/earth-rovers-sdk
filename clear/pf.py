@@ -6,6 +6,7 @@ from collections import deque
 import copy
 import pyproj
 import requests
+import logging
 from typing import Dict, List, Tuple, Any, Optional
 
 class StateEstimationPF:
@@ -13,7 +14,19 @@ class StateEstimationPF:
     Particle Filter for State Estimation
     The estimated state is in the NED frame (North, East, Down)
     """
-    def __init__(self, num_particles=100, wheel_diameter=130, wheel_base=200):
+    def __init__(self, num_particles=100, wheel_diameter=130, wheel_base=200, log_level=logging.INFO):
+        # Set up logging
+        self.logger = logging.getLogger("StateEstimationPF")
+        self.logger.setLevel(log_level)
+        
+        # Create console handler if no handlers exist
+        if not self.logger.handlers:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(log_level)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+        
         max_queue_size = 1000
         # Robot physical parameters
         self.wheel_diameter = wheel_diameter
@@ -79,6 +92,9 @@ class StateEstimationPF:
         
         # Set up projection for GPS conversions (will be initialized later)
         self.proj = None
+        
+        # Store update timestamps for frequency calculation
+        self.update_timestamps = deque(maxlen=100)
     
     def setup_projection(self):
         """Set up the projection system for GPS conversions"""
@@ -96,11 +112,11 @@ class StateEstimationPF:
         
         # Check if we have valid GPS readings
         if not gps_reading:
-            print("Waiting for valid GPS signal...")
+            self.logger.info("Waiting for valid GPS signal...")
             return False
             
         if not mag_reading:
-            print("Waiting for valid magnetometer readings...")
+            self.logger.info("Waiting for valid magnetometer readings...")
             return False
         
         # Initialize position from GPS
@@ -142,7 +158,7 @@ class StateEstimationPF:
             # Initialize projection with reference point
             self.setup_projection()
         
-        print(f"Particle filter initialized at position ({x:.2f}, {y:.2f}) with heading {math.degrees(initial_theta):.2f}°")
+        self.logger.info(f"Particle filter initialized at position ({x:.2f}, {y:.2f}) with heading {math.degrees(initial_theta):.2f}°")
         return True
     
     def start(self):
@@ -151,7 +167,7 @@ class StateEstimationPF:
         
         # Start data collection thread first
         self.data_thread = threading.Thread(target=self.data_collection_thread)
-        self.data_thread.daemon = True
+        # self.data_thread.daemon = True
         self.data_thread.start()
         
         # Wait for initial sensor readings and particle initialization
@@ -162,10 +178,10 @@ class StateEstimationPF:
         
         # Start particle filter thread
         self.pf_thread = threading.Thread(target=self.particle_filter_thread)
-        self.pf_thread.daemon = True
+        # self.pf_thread.daemon = True
         self.pf_thread.start()
         
-        print("State estimation started")
+        self.logger.info("State estimation started")
     
     def stop(self):
         """Stop all threads"""
@@ -174,7 +190,7 @@ class StateEstimationPF:
             self.data_thread.join(timeout=1.0)
         if self.pf_thread:
             self.pf_thread.join(timeout=1.0)
-        print("State estimation stopped")
+        self.logger.info("State estimation stopped")
     
     def data_collection_thread(self):
         """Non-blocking thread to fetch and store sensor data"""
@@ -182,6 +198,7 @@ class StateEstimationPF:
             try:
                 # Get data from robot API
                 new_data = self.get_data()
+                self.logger.debug(f"Data collection thread: {new_data}")
                 if not new_data:
                     time.sleep(0.01)
                     continue
@@ -259,7 +276,7 @@ class StateEstimationPF:
                 time.sleep(0.01)
                 
             except Exception as e:
-                print(f"Error in data collection: {e}")
+                self.logger.error(f"Error in data collection: {e}")
                 time.sleep(0.1)  # Sleep on error to prevent tight loop
     
     def get_data(self):
@@ -271,12 +288,12 @@ class StateEstimationPF:
             
             # Validate data format
             if not isinstance(data, dict):
-                print("Invalid data format from API")
+                self.logger.warning("Invalid data format from API")
                 return None
             
             return data
         except Exception as e:
-            print(f"Error fetching data: {e}")
+            self.logger.error(f"Error fetching data: {e}")
             return None
     
     def particle_filter_thread(self):
@@ -285,7 +302,9 @@ class StateEstimationPF:
         
         while self.running:
             try:
+                self.logger.debug("Trying to get data lock")
                 with self.data_lock:
+                    self.logger.debug("Got data lock")
                     # Get latest timestamps from sensor data
                     latest_timestamps = {
                         sensor: max([reading[-1] for reading in data]) if data else 0
@@ -317,7 +336,7 @@ class StateEstimationPF:
                 self.update_state_estimate()
                 
             except Exception as e:
-                print(f"Error in particle filter thread: {e}")
+                self.logger.error(f"Error in particle filter thread: {e}")
                 time.sleep(0.1)  # Sleep on error to prevent tight loop
     
     def predict(self, current_time, prev_state):
@@ -574,6 +593,9 @@ class StateEstimationPF:
         self.current_state["x"] = x_mean
         self.current_state["y"] = y_mean
         self.current_state["theta"] = theta_mean
+        
+        # Record timestamp for frequency calculation
+        self.update_timestamps.append(time.time())
     
     def get_latest_sensor_data(self, sensor_type):
         """Get the latest reading for a specific sensor type"""
@@ -655,11 +677,124 @@ class StateEstimationPF:
         lon, lat = self.proj(east, north, inverse=True)
         
         return lat, lon
+    
+    def get_uncertainty(self):
+        """
+        Compute the uncertainty of the particle filter state estimate.
+        Returns:
+            position_std: Standard deviation of particle positions (meters)
+            heading_std: Standard deviation of particle headings (radians)
+        """
+        if self.particles is None:
+            return float('inf'), float('inf')
+        
+        # Calculate position uncertainty as the average std dev in x and y
+        pos_x_std = np.std(self.particles[:, 0])
+        pos_y_std = np.std(self.particles[:, 1])
+        position_std = (pos_x_std + pos_y_std) / 2.0
+        
+        # For heading uncertainty, we need to handle circular statistics
+        # Convert angles to unit vectors, compute resultant length
+        cos_theta = np.cos(self.particles[:, 2])
+        sin_theta = np.sin(self.particles[:, 2])
+        
+        # Calculate circular standard deviation
+        resultant_length = np.sqrt(np.mean(cos_theta)**2 + np.mean(sin_theta)**2)
+        heading_std = np.sqrt(-2 * np.log(resultant_length))
+        
+        return position_std, heading_std
+        
+    def get_data_fetching_frequency(self, window_size=10):
+        """
+        Compute the recent update frequency of the particle filter in Hz.
+        
+        Args:
+            window_size: Number of recent updates to consider for frequency calculation
+            
+        Returns:
+            frequency: Update frequency in Hz, or 0 if insufficient data
+        """
+        # Get timestamps from recent sensor data
+        timestamps = []
+        
+        # Collect timestamps from all sensor types
+        for sensor_type in self.sensor_data:
+            data = self.sensor_data[sensor_type]
+            if data:
+                # Extract timestamps from the last elements of each reading
+                sensor_timestamps = [reading[-1] for reading in data]
+                timestamps.extend(sensor_timestamps)
+        
+        # Sort timestamps and take the most recent ones
+        timestamps.sort(reverse=True)
+        recent_timestamps = timestamps[:window_size*5]  # Get more than needed to filter
+        
+        if len(recent_timestamps) < 2:
+            return 0.0  # Not enough data to calculate frequency
+        
+        # Remove duplicates and sort again
+        unique_timestamps = sorted(set(recent_timestamps), reverse=True)
+        
+        # Take only the window_size most recent unique timestamps
+        recent_unique = unique_timestamps[:window_size]
+        
+        if len(recent_unique) < 2:
+            return 0.0  # Not enough unique timestamps
+        
+        # Calculate time differences between consecutive timestamps
+        time_diffs = [recent_unique[i] - recent_unique[i+1] for i in range(len(recent_unique)-1)]
+        
+        # Calculate average time difference
+        avg_time_diff = sum(time_diffs) / len(time_diffs)
+        
+        # Calculate frequency (Hz)
+        if avg_time_diff > 0:
+            return 1.0 / avg_time_diff
+        else:
+            return 0.0  # Avoid division by zero
+    
+    def get_particle_filter_frequency(self, window_size=10):
+        """
+        Compute the recent particle filter update frequency in Hz.
+        This measures how often the particle filter state is being updated.
+        
+        Args:
+            window_size: Number of recent updates to consider for frequency calculation
+            
+        Returns:
+            frequency: Particle filter update frequency in Hz, or 0 if insufficient data
+        """
+        if len(self.update_timestamps) < 2:
+            return 0.0  # Not enough data to calculate frequency
+        
+        # Get the most recent timestamps
+        recent_timestamps = list(self.update_timestamps)[-window_size:]
+        
+        if len(recent_timestamps) < 2:
+            return 0.0  # Not enough timestamps in the window
+        
+        # Calculate time differences between consecutive timestamps
+        time_diffs = [recent_timestamps[i] - recent_timestamps[i-1] for i in range(1, len(recent_timestamps))]
+        
+        # Calculate average time difference
+        avg_time_diff = sum(time_diffs) / len(time_diffs)
+        
+        # Calculate frequency (Hz)
+        if avg_time_diff > 0:
+            return 1.0 / avg_time_diff
+        else:
+            return 0.0  # Avoid division by zero
 
 # Example usage
 if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
     # Create and start the particle filter
-    pf = StateEstimationPF()
+    pf = StateEstimationPF(log_level=logging.INFO)
     pf.start()
     
     try:
