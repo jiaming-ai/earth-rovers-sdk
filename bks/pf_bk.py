@@ -4,7 +4,8 @@ import numpy as np
 import math
 from collections import deque
 import copy
-import pyproj
+from scipy.stats import norm
+import json
 import requests
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -14,6 +15,7 @@ class StateEstimationPF:
     The estimated state is in the NED frame (North, East, Down)
     """
     def __init__(self, num_particles=100, wheel_diameter=130, wheel_base=200):
+
         max_queue_size = 1000
         # Robot physical parameters
         self.wheel_diameter = wheel_diameter
@@ -67,6 +69,14 @@ class StateEstimationPF:
         self.pf_thread = None
         self.data_lock = threading.Lock()
         
+        # Initialize with None to indicate we need first readings
+        self.current_state = {
+            "x": None,
+            "y": None,
+            "theta": None,
+            "timestamp": None
+        }
+        
         # Don't initialize particles yet - wait for first readings
         self.particles = None
         
@@ -76,16 +86,6 @@ class StateEstimationPF:
         
         # Earth's radius in meters
         self.EARTH_RADIUS = 6371000
-        
-        # Set up projection for GPS conversions (will be initialized later)
-        self.proj = None
-    
-    def setup_projection(self):
-        """Set up the projection system for GPS conversions"""
-        if self.ref_lat is not None and self.ref_lon is not None:
-            # Set up a transverse Mercator projection centered on the reference point
-            proj_string = f"+proj=tmerc +lat_0={self.ref_lat} +lon_0={self.ref_lon} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs"
-            self.proj = pyproj.Proj(proj_string)
     
     def init_particles(self):
         """Initialize particles using first GPS and compass readings"""
@@ -94,13 +94,8 @@ class StateEstimationPF:
             gps_reading = self.get_latest_sensor_data("gps")
             mag_reading = self.get_latest_sensor_data("mags")
         
-        # Check if we have valid GPS readings
-        if not gps_reading:
-            print("Waiting for valid GPS signal...")
-            return False
-            
-        if not mag_reading:
-            print("Waiting for valid magnetometer readings...")
+        if not gps_reading or not mag_reading:
+            print("Waiting for initial sensor readings...")
             return False
         
         # Initialize position from GPS
@@ -110,22 +105,16 @@ class StateEstimationPF:
         mx, my, mz, _ = mag_reading
         initial_theta = math.atan2(-my, -mz)  # Convert magnetometer reading to heading
         
-        # Initialize particles around these measurements with vectorized operations
+        # Initialize particles around these measurements
         self.particles = np.zeros((self.num_particles, 3))
         
-        # Create random noise vectors all at once
-        pos_noise = np.random.normal(0, self.gps_noise, (self.num_particles, 2))
-        theta_noise = np.random.normal(0, self.compass_noise, self.num_particles)
+        # Add noise based on sensor uncertainties
+        self.particles[:, 0] = x + np.random.normal(0, self.gps_noise, self.num_particles)
+        self.particles[:, 1] = y + np.random.normal(0, self.gps_noise, self.num_particles)
+        self.particles[:, 2] = initial_theta + np.random.normal(0, self.compass_noise, self.num_particles)
         
-        # Set positions with noise
-        self.particles[:, 0] = x + pos_noise[:, 0]
-        self.particles[:, 1] = y + pos_noise[:, 1]
-        
-        # Set orientation with noise
-        self.particles[:, 2] = initial_theta + theta_noise
-        
-        # Normalize angles (vectorized)
-        self.particles[:, 2] = self.normalize_angle_vector(self.particles[:, 2])
+        # Normalize angles
+        self.particles[:, 2] = self.normalize_angle(self.particles[:, 2])
         
         # Initialize weights uniformly
         self.weights = np.ones(self.num_particles) / self.num_particles
@@ -135,12 +124,6 @@ class StateEstimationPF:
         self.current_state["y"] = y
         self.current_state["theta"] = initial_theta
         self.current_state["timestamp"] = timestamp
-        
-        # Set up the projection for GPS conversion
-        if self.ref_lat is None and self.ref_lon is None:
-            self.ref_lat, self.ref_lon = self.reverse_ned_to_latlon(x, y)
-            # Initialize projection with reference point
-            self.setup_projection()
         
         print(f"Particle filter initialized at position ({x:.2f}, {y:.2f}) with heading {math.degrees(initial_theta):.2f}°")
         return True
@@ -231,10 +214,6 @@ class StateEstimationPF:
                         lon = float(new_data["longitude"])
                         timestamp = float(new_data["timestamp"])
                         
-                        # Skip invalid GPS readings (1000, 1000 indicates no signal)
-                        if lat == 1000 and lon == 1000:
-                            continue
-                        
                         # Convert GPS to meters from reference point
                         x, y = self.gps_to_meters(lat, lon)
                         
@@ -263,9 +242,35 @@ class StateEstimationPF:
                 time.sleep(0.1)  # Sleep on error to prevent tight loop
     
     def get_data(self):
-        """Fetch data from the robot API"""
+        """Fetch data from the robot API
+        Sensor frames:
+        - Accel: 
+            x	g	Positive X = Upward
+            y	g	Positive Y = Left
+            z	g	Positive Z = Backwards
+        - Gyro: 
+            x	Degrees / second	Yaw
+            y	Degrees / second	Pitch
+            z	Degrees / second	Roll
+        - Mag: 
+            x	LSB Raw Data	Positive X = Vertical Up
+            y	LSB Raw Data	Positive Y = West
+            z	LSB Raw Data	Positive Z = South
+        - GPS:
+            latitude	Float	Latitude of the robot
+            longitude	Float	Longitude of the robot
+        - Control:
+            linear	% of max control movement (-1 to 1)	Linear control from the gamer input (1 = Forward ; -1 = Backwards)
+            angular	% of max control movement (-1 to 1)	Angular control from the gamer input (1 = Left ; -1 = Right )
+            rpm_1	Revolutions Per Minute	RPM reading of the Front-Left wheel
+            rpm_2	Revolutions Per Minute	RPM reading of the Front-Right wheel
+            rpm_3	Revolutions Per Minute	RPM reading of the Rear-Left wheel
+            rpm_4	Revolutions Per Minute	RPM reading of the Rear-Right wheel
+            timestamp	Unix Timestamp Epoch (UTC+0)	Timestamp of the data
+        """
         try:
             # Call the API to get sensor data
+            # In a real implementation, this would be replaced with the actual API call
             response = requests.get("http://localhost:8000/data")
             data = response.json()
             
@@ -296,8 +301,7 @@ class StateEstimationPF:
                     current_time = max(latest_timestamps.values()) if latest_timestamps else 0
                     
                     # Skip if not enough time has passed
-                    if (self.current_state["timestamp"] is not None and 
-                        (current_time - self.current_state["timestamp"]) < update_threshold):
+                    if (current_time - self.current_state["timestamp"]) < update_threshold:
                         time.sleep(0.01)  # Small sleep to prevent tight loop
                         continue
                     
@@ -322,12 +326,15 @@ class StateEstimationPF:
     
     def predict(self, current_time, prev_state):
         """
-        Vectorized prediction step of the particle filter using motion model in NED frame
+        Prediction step of the particle filter using motion model in NED frame
         Args:
             current_time: Current timestamp
             prev_state: Previous state estimate (x, y, theta, timestamp)
+            x: North (meters)
+            y: East (meters)
+            theta: heading in radians (0 = North, pi/2 = East)
         """
-        if prev_state["timestamp"] is None or prev_state["timestamp"] == 0:
+        if prev_state["timestamp"] == 0:
             self.current_state["timestamp"] = current_time
             return
         
@@ -341,141 +348,102 @@ class StateEstimationPF:
         noise_scale = min(5.0, max(1.0, time_diff))
         
         with self.data_lock:
-            # Get relevant sensor data between prev_time and current_time
+            # Get relevant IMU and wheel encoder data between prev_time and current_time
             accel_data = [a for a in self.sensor_data["accels"] if prev_time < a[3] <= current_time]
             gyro_data = [g for g in self.sensor_data["gyros"] if prev_time < g[3] <= current_time]
             rpm_data = [r for r in self.sensor_data["rpms"] if prev_time < r[4] <= current_time]
         
-        # Extract current particle states
-        theta = self.particles[:, 2]
-        
-        # Initialize deltas with zeros
-        delta_x = np.zeros(self.num_particles)
-        delta_y = np.zeros(self.num_particles)
-        delta_theta = np.zeros(self.num_particles)
-        
-        # Process wheel encoder data if available
-        if rpm_data:
-            # Sort RPM data by timestamp
-            rpm_data.sort(key=lambda x: x[4])
+        # Apply motion model to each particle
+        for i in range(self.num_particles):
+            x, y, theta = self.particles[i]
             
-            for j in range(len(rpm_data)):
-                # Get wheel RPMs
-                left_rpm, right_rpm = rpm_data[j][0], rpm_data[j][1]
-                reading_time = rpm_data[j][4]
-                
-                # Calculate time difference
-                if j > 0:
-                    dt = reading_time - rpm_data[j-1][4]
-                else:
-                    dt = reading_time - prev_time
-                
-                # Skip if dt is invalid
-                if dt <= 0:
-                    continue
-                
-                # Convert RPM to linear velocity (meters per second)
-                wheel_circumference = 2 * math.pi * self.wheel_radius / 1000  # Convert to meters
-                vl = left_rpm * wheel_circumference / 60
-                vr = right_rpm * wheel_circumference / 60
-                
-                # Differential drive kinematics
-                v = (vl + vr) / 2  # Linear velocity
-                omega = (vr - vl) / (self.wheel_base / 1000)  # Angular velocity
-                
-                # Vectorized update for all particles
-                # Handle straight line vs. curved motion
-                straight_motion = np.abs(omega) < 1e-6
-                
-                # Update straight motion particles (vectorized)
-                if np.any(straight_motion):
-                    delta_x[straight_motion] += v * dt * np.cos(theta[straight_motion])
-                    delta_y[straight_motion] += v * dt * np.sin(theta[straight_motion])
-                
-                # Update curved motion particles (vectorized)
-                if np.any(~straight_motion):
-                    # Radius of curvature for each particle
-                    r = v / omega
-                    
-                    # Update for curved motion
-                    delta_x[~straight_motion] += r * (np.sin(theta[~straight_motion] + omega * dt) - 
-                                                     np.sin(theta[~straight_motion]))
-                    delta_y[~straight_motion] += r * (np.cos(theta[~straight_motion]) - 
-                                                     np.cos(theta[~straight_motion] + omega * dt))
-                    delta_theta[~straight_motion] += omega * dt
-        
-        # Use gyro data for orientation update when wheel encoders are insufficient
-        if not rpm_data or len(rpm_data) < 2:
-            if gyro_data:
-                # Process all gyro readings at once for more efficient computation
-                gyro_times = np.array([g[3] for g in gyro_data])
-                gyro_yaw_rates = np.array([math.radians(g[0]) for g in gyro_data])  # Convert to radians/s
-                
-                if len(gyro_data) > 1:
-                    # Calculate time differences between consecutive readings
-                    dt_array = np.diff(gyro_times, prepend=prev_time)
-                    # Apply orientation updates
-                    delta_theta_gyro = np.sum(gyro_yaw_rates * dt_array)
-                    delta_theta += delta_theta_gyro
-                else:
-                    # Only one reading, use time_diff
-                    delta_theta += gyro_yaw_rates[0] * time_diff
+            delta_x = 0  # Change in North
+            delta_y = 0  # Change in East
+            delta_theta = 0
             
-            # Instead of double integration with accelerometer data,
-            # use a simplified motion model based on acceleration magnitude
-            if accel_data and len(accel_data) >= 3:
-                # Convert accelerometer data to numpy array for vectorized operations
-                accel_array = np.array(accel_data)
+            # Use wheel encoder data if available
+            if rpm_data:
+                # Sort RPM data by timestamp to ensure chronological order
+                rpm_data.sort(key=lambda x: x[4])
                 
-                # Compute mean acceleration over the interval
-                mean_accel = np.mean(accel_array[:, :3], axis=0)
-                
-                # Convert from g to m/s²
-                g = 9.81
-                mean_accel *= g
-                
-                # In the robot frame: x=up, y=left, z=backward
-                # Convert to NED: forward=-z, right=-y
-                ax_ned = -mean_accel[2]  # Forward acceleration (North)
-                ay_ned = -mean_accel[1]  # Right acceleration (East)
-                
-                # Compute approximate velocity change instead of position
-                # This avoids double integration problems
-                accel_magnitude = np.sqrt(ax_ned**2 + ay_ned**2)
-                
-                # Only apply if acceleration is significant (filter noise)
-                if accel_magnitude > 0.2:  # Threshold to filter out noise
-                    # Direction of acceleration in global frame
-                    accel_heading = math.atan2(ay_ned, ax_ned)
+                for j in range(len(rpm_data)):
+                    # Front-Left and Front-Right wheel RPMs
+                    left_rpm, right_rpm = rpm_data[j][0], rpm_data[j][1]
+                    reading_time = rpm_data[j][4]
                     
-                    # Apply a simplified model (v = a*t) with scale factor to reduce drift
-                    v_estimate = accel_magnitude * time_diff * 0.5  # Scale factor
+                    # Calculate time difference between consecutive RPM readings
+                    if j > 0:
+                        dt = reading_time - rpm_data[j-1][4]
+                    else:
+                        dt = reading_time - prev_time
                     
-                    # Update all particles with this velocity estimate
-                    # But in each particle's individual direction
-                    delta_x += v_estimate * np.cos(theta)
-                    delta_y += v_estimate * np.sin(theta)
-        
-        # Generate noise vectors for all particles at once
-        noise = np.random.normal(
-            scale=[
-                self.motion_noise["x"] * noise_scale,
-                self.motion_noise["y"] * noise_scale,
-                self.motion_noise["theta"] * noise_scale
-            ],
-            size=(self.num_particles, 3)
-        )
-        
-        # Apply motion updates with noise in a vectorized manner
-        self.particles[:, 0] += delta_x + noise[:, 0]
-        self.particles[:, 1] += delta_y + noise[:, 1]
-        self.particles[:, 2] = self.normalize_angle_vector(self.particles[:, 2] + delta_theta + noise[:, 2])
+                    # Skip if dt is invalid
+                    if dt <= 0:
+                        continue
+                    
+                    # Convert RPM to linear velocity (meters per second)
+                    wheel_circumference = 2 * math.pi * self.wheel_radius / 1000  # Convert to meters
+                    vl = left_rpm * wheel_circumference / 60
+                    vr = right_rpm * wheel_circumference / 60
+                    
+                    # Differential drive kinematics
+                    v = (vl + vr) / 2  # Linear velocity
+                    omega = (vr - vl) / (self.wheel_base / 1000)  # Angular velocity
+                    
+                    # Update position and orientation in NED frame
+                    if abs(omega) < 1e-6:  # Straight line motion
+                        delta_x += v * dt * math.cos(theta)  # North component
+                        delta_y += v * dt * math.sin(theta)  # East component
+                    else:  # Curved motion
+                        r = v / omega  # Radius of curvature
+                        delta_x += r * (math.sin(theta + omega * dt) - math.sin(theta))
+                        delta_y += r * (math.cos(theta) - math.cos(theta + omega * dt))
+                        delta_theta += omega * dt
+            
+            # Use IMU data if wheel encoder data is insufficient
+            if not rpm_data or len(rpm_data) < 2:
+                # Convert gyroscope data (degrees/s to rad/s) and handle frame conversion
+                if gyro_data:
+                    for gyro in gyro_data:
+                        # Convert from degrees/s to rad/s and handle frame conversion
+                        # Note: gyro.x is yaw rate, but we need to convert to NED frame
+                        yaw_rate = math.radians(gyro[0])  # Convert to radians/s
+                        dt = time_diff if len(gyro_data) <= 1 else gyro[3] - gyro_data[0][3]
+                        delta_theta += yaw_rate * dt
+                
+                # Handle accelerometer data (convert from g to m/s²)
+                if len(accel_data) >= 3:
+                    g = 9.81  # m/s²
+                    for i in range(1, len(accel_data)):
+                        # Convert from g to m/s² and transform to NED frame
+                        # accel.x is up (+), accel.y is left (+), accel.z is backward (+)
+                        ax = -accel_data[i][2] * g  # Forward = -z_accel (North)
+                        ay = -accel_data[i][1] * g  # Right = -y_accel (East)
+                        
+                        dt = accel_data[i][3] - accel_data[i-1][3]
+                        
+                        # Rotate acceleration to NED frame using current heading
+                        ax_ned = ax * math.cos(theta) - ay * math.sin(theta)
+                        ay_ned = ax * math.sin(theta) + ay * math.cos(theta)
+                        
+                        # Double integration for position
+                        dvx = ax_ned * dt
+                        dvy = ay_ned * dt
+                        
+                        delta_x += dvx * dt
+                        delta_y += dvy * dt
+
+            # Apply motion updates with noise
+            self.particles[i, 0] += delta_x + np.random.normal(0, self.motion_noise["x"] * noise_scale)
+            self.particles[i, 1] += delta_y + np.random.normal(0, self.motion_noise["y"] * noise_scale)
+            self.particles[i, 2] = self.normalize_angle(self.particles[i, 2] + delta_theta + 
+                                  np.random.normal(0, self.motion_noise["theta"] * noise_scale))
         
         # Update timestamp
         self.current_state["timestamp"] = current_time
     
     def update(self):
-        """Vectorized measurement update step using GPS and compass data"""
+        """Measurement update step of the particle filter using GPS and compass data"""
         with self.data_lock:
             # Get the latest GPS and magnetometer readings
             latest_gps = self.get_latest_sensor_data("gps")
@@ -490,14 +458,21 @@ class StateEstimationPF:
         
         # Update weights based on GPS measurement
         if latest_gps:
-            gps_x, gps_y, _ = latest_gps
+            lat, lon, _ = latest_gps
             
-            # Calculate distances for all particles at once
-            particle_x, particle_y = self.particles[:, 0], self.particles[:, 1]
-            distances = np.sqrt((particle_x - gps_x)**2 + (particle_y - gps_y)**2)
+            # In a real system, you would convert lat/lon to your coordinate system
+            # Here I'll assume lat/lon are already in meters from origin for simplicity
+            gps_x, gps_y = lat, lon
             
-            # Update log-weights based on GPS measurement likelihood
-            log_weights += self.gaussian_log_likelihood_vector(distances, 0, self.gps_noise)
+            # Calculate likelihood for each particle
+            for i in range(self.num_particles):
+                particle_x, particle_y = self.particles[i, 0], self.particles[i, 1]
+                
+                # Mahalanobis distance to GPS measurement
+                distance = np.sqrt((particle_x - gps_x)**2 + (particle_y - gps_y)**2)
+                
+                # Update log-weight based on GPS measurement likelihood
+                log_weights[i] += self.gaussian_log_likelihood(distance, 0, self.gps_noise)
         
         # Update weights based on compass measurement
         if latest_mag:
@@ -505,62 +480,77 @@ class StateEstimationPF:
             mag_x, mag_y, mag_z, _ = latest_mag
             
             # Calculate heading from magnetometer
-            heading = math.atan2(-mag_y, -mag_z)
+            # The compass frame is (Vertical Up, West, South)
+            # So we need to convert to get a proper heading
+            # Assuming the magnetometer is roughly level
+            heading = math.atan2(-mag_y, -mag_z)  # Convert from (West, South) to a heading
             
-            # Calculate angle differences for all particles
-            particle_theta = self.particles[:, 2]
-            angle_diff = self.normalize_angle_vector(particle_theta - heading)
-            
-            # Update log-weights based on compass measurement likelihood
-            log_weights += self.gaussian_log_likelihood_vector(angle_diff, 0, self.compass_noise)
+            # Calculate likelihood for each particle
+            for i in range(self.num_particles):
+                particle_theta = self.particles[i, 2]
+                
+                # Calculate angle difference
+                angle_diff = self.normalize_angle(particle_theta - heading)
+                
+                # Update log-weight based on compass measurement likelihood
+                log_weights[i] += self.gaussian_log_likelihood(angle_diff, 0, self.compass_noise)
         
-        # Convert log-weights to weights with numerical stability
+        # Convert log-weights to weights
+        # Shifting max log-weight to avoid numerical underflow
         max_log_weight = np.max(log_weights)
         weights = np.exp(log_weights - max_log_weight)
         
         # Normalize weights
-        sum_weights = np.sum(weights)
-        if sum_weights > 0:
-            self.weights = weights / sum_weights
+        if np.sum(weights) > 0:
+            self.weights = weights / np.sum(weights)
         else:
             # If all weights are zero, reinitialize with uniform weights
             self.weights = np.ones(self.num_particles) / self.num_particles
     
     def resample(self):
-        """Vectorized resampling of particles based on weights"""
+        """Resample particles based on their weights"""
         # Calculate effective number of particles
         n_eff = 1.0 / np.sum(np.square(self.weights))
         
         # Resample if effective number of particles is too low
+        # (typically when n_eff < num_particles/2)
         if n_eff < self.num_particles / 2:
             # Systematic resampling
             indices = self.systematic_resample()
             
-            # Create new particles by indexing
-            self.particles = self.particles[indices]
+            # Create new particles array
+            new_particles = np.zeros((self.num_particles, 3))
+            
+            # Copy selected particles
+            for i in range(self.num_particles):
+                new_particles[i] = self.particles[indices[i]]
+            
+            # Update particles
+            self.particles = new_particles
             
             # Reset weights
             self.weights = np.ones(self.num_particles) / self.num_particles
     
     def systematic_resample(self):
-        """Vectorized systematic resampling algorithm"""
-        # Create evenly spaced points with a random offset
+        """Systematic resampling algorithm"""
         positions = (np.arange(self.num_particles) + np.random.random()) / self.num_particles
         
-        # Calculate cumulative sum of weights
+        indices = np.zeros(self.num_particles, dtype=int)
         cumulative_sum = np.cumsum(self.weights)
+        i, j = 0, 0
         
-        # Find indices using searchsorted for better performance
-        indices = np.searchsorted(cumulative_sum, positions)
-        
-        # Handle edge case where searchsorted might return an index = len(cumulative_sum)
-        indices = np.clip(indices, 0, len(cumulative_sum) - 1)
+        while i < self.num_particles:
+            if positions[i] < cumulative_sum[j]:
+                indices[i] = j
+                i += 1
+            else:
+                j += 1
         
         return indices
     
     def update_state_estimate(self):
-        """Update the current state estimate based on weighted particles"""
-        # Weighted average for position (vectorized)
+        """Update the current state estimate based on particle weights"""
+        # Weighted average for position
         x_mean = np.sum(self.particles[:, 0] * self.weights)
         y_mean = np.sum(self.particles[:, 1] * self.weights)
         
@@ -589,21 +579,13 @@ class StateEstimationPF:
         """Normalize angle to be between -pi and pi"""
         return (angle + math.pi) % (2 * math.pi) - math.pi
     
-    def normalize_angle_vector(self, angles):
-        """Vectorized version of normalize_angle for numpy arrays"""
-        return (angles + np.pi) % (2 * np.pi) - np.pi
-    
     def gaussian_log_likelihood(self, x, mean, std_dev):
         """Calculate log-likelihood of x under a Gaussian distribution"""
         return -0.5 * ((x - mean) / std_dev)**2 - math.log(std_dev) - 0.5 * math.log(2 * math.pi)
     
-    def gaussian_log_likelihood_vector(self, x, mean, std_dev):
-        """Vectorized version of gaussian_log_likelihood"""
-        return -0.5 * ((x - mean) / std_dev)**2 - np.log(std_dev) - 0.5 * np.log(2 * np.pi)
-    
     def handle_outliers(self, data_list, threshold=3.0):
         """
-        Vectorized outlier detection using z-score method
+        Simple outlier detection using z-score method
         Returns data with outliers removed
         """
         if not data_list or len(data_list) < 4:
@@ -612,49 +594,40 @@ class StateEstimationPF:
         # Convert to numpy array for easier calculations
         data_array = np.array(data_list)
         
-        # Calculate z-scores in a vectorized way
+        # Calculate z-scores
         mean = np.mean(data_array, axis=0)
         std = np.std(data_array, axis=0)
+        z_scores = np.abs((data_array - mean) / (std + 1e-10))  # Add small epsilon to avoid division by zero
         
-        # Avoid division by zero
-        std = np.where(std < 1e-10, 1e-10, std)
-        
-        # Calculate z-scores for each dimension
-        z_scores = np.abs((data_array - mean) / std)
-        
-        # Find indices of non-outliers (all dimensions must pass the test)
+        # Find indices of non-outliers
         non_outliers = np.all(z_scores < threshold, axis=1)
         
         # Return non-outlier data
         return data_array[non_outliers].tolist()
-    
+
     def gps_to_meters(self, lat, lon):
-        """Convert GPS coordinates to meters in NED frame using pyproj"""
+        """Convert GPS coordinates to meters from reference point using flat Earth approximation.
+        Returns (North, East) coordinates in meters to match NED frame convention."""
         if self.ref_lat is None or self.ref_lon is None:
             self.ref_lat = lat
             self.ref_lon = lon
-            self.setup_projection()
             return 0, 0
         
-        if self.proj is None:
-            self.setup_projection()
+        # Convert latitude/longitude from degrees to radians
+        lat1, lon1 = math.radians(self.ref_lat), math.radians(self.ref_lon)
+        lat2, lon2 = math.radians(lat), math.radians(lon)
         
-        # Convert from lat/lon to projected coordinates
-        east, north = self.proj(lon, lat)
+        # Calculate differences
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
         
-        # NED frame convention has north as x and east as y
-        return north, east
-    
-    def reverse_ned_to_latlon(self, north, east):
-        """Convert NED coordinates back to lat/lon using pyproj"""
-        if self.proj is None:
-            # If projection isn't set up yet, return a default location
-            return 0, 0
+        # Calculate North-South distance
+        north = dlat * self.EARTH_RADIUS
         
-        # Convert from NED to lat/lon using inverse projection
-        lon, lat = self.proj(east, north, inverse=True)
+        # Calculate East-West distance
+        east = dlon * self.EARTH_RADIUS * math.cos(lat1)
         
-        return lat, lon
+        return north, east  # Returns (North, East) in meters to match NED frame
 
 # Example usage
 if __name__ == "__main__":
