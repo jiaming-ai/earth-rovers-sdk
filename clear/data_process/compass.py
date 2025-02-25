@@ -785,7 +785,7 @@ class CompassCalibrator:
         kf.Q = np.diag([0.1, 1])  # Adjust based on expected system dynamics
         
         # Measurement noise (uncertainties in each sensor)
-        # Order: [mag_heading, gps_heading, rpm_heading]
+        # Order: [mag_heading, gps_heading (optional), rpm_heading (optional)]
         kf.R = np.diag([10, 5, 20])  # GPS more reliable than magnetometer, RPM less reliable
         
         smoothed_headings = []
@@ -801,13 +801,13 @@ class CompassCalibrator:
                     'heading': first_heading
                 })
                 continue
-                
+                    
             # Time update
             dt = current_ts - prev_ts
             if dt <= 0:
                 # Skip entries with non-positive time difference
                 continue
-                
+                    
             # Update state transition matrix for current dt
             kf.F = np.array([
                 [1, dt],
@@ -870,34 +870,35 @@ class CompassCalibrator:
             
             # Update if we have measurements
             if measurements:
-                # Create measurement vector
-                z = np.array(measurements).reshape(-1, 1)
+                # FIX: Ensure we have a correctly sized measurement vector
+                # Create a zero vector with the expected shape (3, 1)
+                z = np.zeros((n_measurements, 1))
+                # Create a zero matrix with the expected shape
+                H = np.zeros((n_measurements, n_states))
+                # High uncertainty for padding values
+                R = np.eye(n_measurements) * 1000  
                 
-                # Create measurement matrix
-                H = np.array(H_rows)
-                
-                # Update measurement noise matrix dimensions
-                R_dim = len(measurements)
-                R = np.eye(R_dim)
-                
-                # Set measurement noise based on sensor type
-                for j in range(R_dim):
-                    if j < len(H_rows):
-                        if H_rows[j][0] == 1:  # Heading measurement
-                            if j == 0:  # Magnetometer
-                                R[j, j] = 10
-                            elif j == 1:  # GPS
-                                R[j, j] = 5
-                            elif j == 2:  # RPM
-                                R[j, j] = 20
-                        elif H_rows[j][1] == 1:  # Angular velocity measurement
-                            R[j, j] = 15
+                # Fill in available measurements (up to the expected number)
+                for j in range(min(len(measurements), n_measurements)):
+                    z[j, 0] = measurements[j]
+                    H[j] = H_rows[j]
+                    
+                    # Set appropriate uncertainty based on measurement type
+                    if H_rows[j][0] == 1:  # Heading measurement
+                        if j == 0:  # Magnetometer
+                            R[j, j] = 10
+                        elif j == 1:  # GPS
+                            R[j, j] = 5
+                        elif j == 2:  # RPM
+                            R[j, j] = 20
+                    elif H_rows[j][1] == 1:  # Angular velocity measurement
+                        R[j, j] = 15
                 
                 # Update Kalman filter parameters
                 kf.H = H
                 kf.R = R
                 
-                # Update state
+                # Update state with correctly shaped measurement vector
                 kf.update(z)
             
             # Get smoothed heading (normalized to 0-360)

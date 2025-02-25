@@ -8,6 +8,9 @@ from matplotlib.gridspec import GridSpec
 from clear.data_process.compass import CompassCalibrator
 import seaborn as sns
 from scipy.spatial import ConvexHull
+import json
+import re
+import glob
 
 def read_csv_data(file_path, data_type):
     """
@@ -15,44 +18,78 @@ def read_csv_data(file_path, data_type):
     
     Args:
         file_path: Path to the CSV file
-        data_type: Type of data ('gps', 'mag', or 'rpm')
+        data_type: Type of data ('gps', 'mag', 'rpm', or 'imu')
         
     Returns:
         List of dictionaries with the data
     """
     data = []
     
-    with open(file_path, 'r') as f:
-        reader = csv.DictReader(f)
+    if data_type == 'imu':
+        # Handle IMU data with nested JSON-like structure
         
-        for row in reader:
-            entry = {'timestamp': float(row['timestamp'])}
+        with open(file_path, 'r') as f:
+            reader = csv.reader(f)
+            headers = next(reader)  # Skip header row
             
-            if data_type == 'gps':
-                entry['latitude'] = float(row['latitude'])
-                entry['longitude'] = float(row['longitude'])
-            elif data_type == 'mag':
-                entry['x'] = float(row['x'])
-                entry['y'] = float(row['y'])
-                entry['z'] = float(row['z'])
-            elif data_type == 'rpm':
-                entry['rpm_1'] = float(row['rpm_1'])
-                entry['rpm_2'] = float(row['rpm_2'])
-                entry['rpm_3'] = float(row['rpm_3'])
-                entry['rpm_4'] = float(row['rpm_4'])
+            for row in reader:
+                if len(row) < 4:  # Ensure we have enough columns
+                    continue
                 
-            data.append(entry)
+                timestamp = float(row[3])  # Last column is timestamp
+                
+                # Extract compass data (magnetometer)
+                compass_str = row[0]
+                try:
+                    # Clean up the string to make it valid JSON
+                    compass_str = compass_str.replace('""', '"')  # Fix double quotes
+                    # Extract the array content using regex
+                    match = re.search(r'\[\[(.*?)\]\]', compass_str)
+                    if match:
+                        compass_values = match.group(1).split(', ')
+                        # Remove remaining quotes
+                        x = float(compass_values[0].replace('"', ''))
+                        y = float(compass_values[1].replace('"', ''))
+                        z = float(compass_values[2].replace('"', ''))
+                        
+                        data.append({
+                            'timestamp': timestamp,
+                            'x': x,
+                            'y': y,
+                            'z': z
+                        })
+                except Exception as e:
+                    print(f"Error parsing compass data: {e}")
+                    continue
+    else:
+        # Handle standard CSV formats
+        with open(file_path, 'r') as f:
+            reader = csv.DictReader(f)
+            
+            for row in reader:
+                entry = {'timestamp': float(row['timestamp'])}
+                
+                if data_type == 'gps':
+                    entry['latitude'] = float(row['latitude'])
+                    entry['longitude'] = float(row['longitude'])
+                elif data_type == 'rpm':
+                    entry['rpm_1'] = float(row['rpm_1'])
+                    entry['rpm_2'] = float(row['rpm_2'])
+                    entry['rpm_3'] = float(row['rpm_3'])
+                    entry['rpm_4'] = float(row['rpm_4'])
+                    
+                data.append(entry)
     
     return sorted(data, key=lambda x: x['timestamp'])
 
-def compare_calibration_methods(gps_csv, mag_csv, rpm_csv, output_dir='./output',
+def compare_calibration_methods(gps_csv, imu_csv, rpm_csv, output_dir='./output',
                               wheel_diameter=130, wheel_base=200):
     """
     Run different calibration methods and compare their results
     
     Args:
         gps_csv: Path to GPS data CSV
-        mag_csv: Path to magnetometer data CSV
+        imu_csv: Path to IMU data CSV (containing magnetometer data)
         rpm_csv: Path to RPM data CSV
         output_dir: Directory to save results
         wheel_diameter: Diameter of wheels in mm
@@ -67,7 +104,7 @@ def compare_calibration_methods(gps_csv, mag_csv, rpm_csv, output_dir='./output'
     # Read data from CSV files
     print("Loading data from CSV files...")
     gps_data = read_csv_data(gps_csv, 'gps')
-    mag_data = read_csv_data(mag_csv, 'mag')
+    mag_data = read_csv_data(imu_csv, 'imu')  # Changed from mag_csv to imu_csv
     rpm_data = read_csv_data(rpm_csv, 'rpm')
     
     print(f"Loaded {len(gps_data)} GPS points, {len(mag_data)} magnetometer points, {len(rpm_data)} RPM points")
@@ -180,7 +217,7 @@ def run_ellipsoid_only_calibration(calibrator, mag_data, gps_data):
     """
     # First perform ellipsoid fitting
     ellipsoid_params = calibrator._perform_ellipsoid_fitting(mag_data)
-    calibrator.ellipsoid_params = ellipsoid_params
+    calibrator.calibration_params = ellipsoid_params # a hack to print it later for comparison
     
     # Apply calibration manually
     calibrated_headings = []
@@ -617,16 +654,36 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Compare compass calibration methods')
-    parser.add_argument('--gps', required=True, help='Path to GPS CSV file')
-    parser.add_argument('--mag', required=True, help='Path to magnetometer CSV file')
-    parser.add_argument('--rpm', required=True, help='Path to RPM CSV file')
+    parser.add_argument('--data-dir', default='./data', help='Directory containing data files')
     parser.add_argument('--output', default='./calibration_results', help='Output directory')
     parser.add_argument('--wheel-diameter', type=float, default=130, help='Wheel diameter in mm')
     parser.add_argument('--wheel-base', type=float, default=200, help='Wheel base in mm')
     
     args = parser.parse_args()
     
+    # Automatically discover files in the data directory
+    data_dir = args.data_dir
+    
+    # Find files matching the patterns
+    gps_files = glob.glob(os.path.join(data_dir, "gps_data_*.csv"))
+    imu_files = glob.glob(os.path.join(data_dir, "imu_data_*.csv"))
+    rpm_files = glob.glob(os.path.join(data_dir, "control_data_*.csv"))
+    
+    if not gps_files:
+        raise FileNotFoundError(f"No GPS data file found in {data_dir}. Expected pattern: gps_data_*.csv")
+    if not imu_files:
+        raise FileNotFoundError(f"No IMU data file found in {data_dir}. Expected pattern: imu_data_*.csv")
+    if not rpm_files:
+        raise FileNotFoundError(f"No control/RPM data file found in {data_dir}. Expected pattern: control_data_*.csv")
+    
+    # Use the first matching file of each type
+    gps_file = gps_files[0]
+    imu_file = imu_files[0]
+    rpm_file = rpm_files[0]
+    
+    print(f"Using files:\n  GPS: {os.path.basename(gps_file)}\n  IMU: {os.path.basename(imu_file)}\n  RPM: {os.path.basename(rpm_file)}")
+    
     results = compare_calibration_methods(
-        args.gps, args.mag, args.rpm, args.output,
+        gps_file, imu_file, rpm_file, args.output,
         args.wheel_diameter, args.wheel_base
     )
