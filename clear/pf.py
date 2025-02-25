@@ -14,7 +14,15 @@ class StateEstimationPF:
     Particle Filter for State Estimation
     The estimated state is in the NED frame (North, East, Down)
     """
-    def __init__(self, num_particles=100, wheel_diameter=130, wheel_base=200, log_level=logging.INFO):
+    def __init__(self, num_particles=300, wheel_diameter=130, wheel_base=200, log_level=logging.INFO,
+                 # Particle filter hyperparameters
+                 motion_noise_x=0.1,      # Position noise in x direction (meters)
+                 motion_noise_y=0.1,      # Position noise in y direction (meters)
+                 motion_noise_theta=0.05, # Orientation noise (radians)
+                 gps_noise=3.0,           # GPS measurement noise (meters)
+                 compass_noise=0.1,       # Compass/magnetometer noise (radians)
+                 resample_threshold=0.5,  # Resampling threshold (fraction of num_particles)
+                 update_threshold=0.05):  # Minimum time between updates (seconds)
         # Set up logging
         self.logger = logging.getLogger("StateEstimationPF")
         self.logger.setLevel(log_level)
@@ -37,6 +45,8 @@ class StateEstimationPF:
         self.num_particles = num_particles
         self.particles = None  # Will be initialized in init_particles
         self.weights = np.ones(num_particles) / num_particles
+        self.resample_threshold = resample_threshold  # Threshold for effective sample size
+        self.update_threshold = update_threshold      # Minimum time between updates
         
         # Data storage
         self.sensor_data = {
@@ -64,21 +74,19 @@ class StateEstimationPF:
             "timestamp": None
         }
         
-        # Noise parameters
+        # Noise parameters (important for tuning)
         self.motion_noise = {
-            "x": 0.1,
-            "y": 0.1,
-            "theta": 0.05
+            "x": motion_noise_x,         # Position noise in x (meters)
+            "y": motion_noise_y,         # Position noise in y (meters)
+            "theta": motion_noise_theta  # Orientation noise (radians)
         }
         
-        self.gps_noise = 3.0  # meters
-        self.compass_noise = 0.1  # radians
+        self.gps_noise = gps_noise        # GPS measurement noise (meters)
+        self.compass_noise = compass_noise # Compass measurement noise (radians)
         
         # Threading control
         self.running = False
         self.data_thread = None
-        self.pf_thread = None
-        self.data_lock = threading.Lock()
         
         # Don't initialize particles yet - wait for first readings
         self.particles = None
@@ -87,14 +95,18 @@ class StateEstimationPF:
         self.ref_lat = None
         self.ref_lon = None
         
-        # Earth's radius in meters
-        self.EARTH_RADIUS = 6371000
-        
         # Set up projection for GPS conversions (will be initialized later)
         self.proj = None
         
         # Store update timestamps for frequency calculation
         self.update_timestamps = deque(maxlen=100)
+        
+        self.is_initialized = False
+        
+        # Log the hyperparameters
+        self.logger.info(f"Particle Filter initialized with {num_particles} particles")
+        self.logger.info(f"Motion noise: x={motion_noise_x}m, y={motion_noise_y}m, θ={motion_noise_theta}rad")
+        self.logger.info(f"Sensor noise: GPS={gps_noise}m, Compass={compass_noise}rad")
     
     def setup_projection(self):
         """Set up the projection system for GPS conversions"""
@@ -106,9 +118,8 @@ class StateEstimationPF:
     def init_particles(self):
         """Initialize particles using first GPS and compass readings"""
         # Try to get initial GPS and magnetometer readings
-        with self.data_lock:
-            gps_reading = self.get_latest_sensor_data("gps")
-            mag_reading = self.get_latest_sensor_data("mags")
+        gps_reading = self.get_latest_sensor_data("gps")
+        mag_reading = self.get_latest_sensor_data("mags")
         
         # Check if we have valid GPS readings
         if not gps_reading:
@@ -162,122 +173,155 @@ class StateEstimationPF:
         return True
     
     def start(self):
-        """Start the data collection and particle filter threads"""
+        """Start the state estimation with a single thread"""
         self.running = True
         
-        # Start data collection thread first
-        self.data_thread = threading.Thread(target=self.data_collection_thread)
-        # self.data_thread.daemon = True
+        # Start the single thread for data collection and particle filter
+        self.data_thread = threading.Thread(target=self.combined_thread)
         self.data_thread.start()
         
-        # Wait for initial sensor readings and particle initialization
-        while self.particles is None:
-            if self.init_particles():
-                break
-            time.sleep(0.1)
-        
-        # Start particle filter thread
-        self.pf_thread = threading.Thread(target=self.particle_filter_thread)
-        # self.pf_thread.daemon = True
-        self.pf_thread.start()
-        
-        self.logger.info("State estimation started")
+        self.logger.info("State estimation started with single thread")
     
     def stop(self):
         """Stop all threads"""
         self.running = False
         if self.data_thread:
             self.data_thread.join(timeout=1.0)
-        if self.pf_thread:
-            self.pf_thread.join(timeout=1.0)
         self.logger.info("State estimation stopped")
     
-    def data_collection_thread(self):
-        """Non-blocking thread to fetch and store sensor data"""
+    def combined_thread(self):
+        """Single thread that handles both data collection and particle filter processing"""
+        update_threshold = 0.05  # 50ms threshold for updates
+        
+        # Wait for initial sensor readings and particle initialization
+        while self.running and self.particles is None:
+            # Get data from robot API
+            new_data = self.get_data()
+            if new_data:
+                self.process_sensor_data(new_data)
+                self.init_particles()
+                self.is_initialized = True
+            time.sleep(0.01)
+        
+        # Record first update timestamp after initialization
+        self.update_timestamps.append(time.time())
+        
         while self.running:
             try:
                 # Get data from robot API
                 new_data = self.get_data()
-                self.logger.debug(f"Data collection thread: {new_data}")
                 if not new_data:
                     time.sleep(0.01)
                     continue
                 
                 # Process and store the data
-                with self.data_lock:
-                    # Process accelerometer readings
-                    if "accels" in new_data and new_data["accels"]:
-                        # Apply outlier detection before storing
-                        filtered_accels = self.handle_outliers(new_data["accels"], threshold=3.0)
-                        for reading in filtered_accels:
-                            timestamp = reading[3]
-                            if timestamp > self.last_processed["accels"]:
-                                self.sensor_data["accels"].append(reading)
-                                self.last_processed["accels"] = max(self.last_processed["accels"], timestamp)
-                    
-                    # Process gyroscope readings
-                    if "gyros" in new_data and new_data["gyros"]:
-                        filtered_gyros = self.handle_outliers(new_data["gyros"], threshold=3.0)
-                        for reading in filtered_gyros:
-                            timestamp = reading[3]
-                            if timestamp > self.last_processed["gyros"]:
-                                self.sensor_data["gyros"].append(reading)
-                                self.last_processed["gyros"] = max(self.last_processed["gyros"], timestamp)
-                    
-                    # Process magnetometer readings
-                    if "mags" in new_data and new_data["mags"]:
-                        filtered_mags = self.handle_outliers(new_data["mags"], threshold=3.0)
-                        for reading in filtered_mags:
-                            timestamp = reading[3]
-                            if timestamp > self.last_processed["mags"]:
-                                self.sensor_data["mags"].append(reading)
-                                self.last_processed["mags"] = max(self.last_processed["mags"], timestamp)
-                    
-                    # Process wheel encoder (RPM) readings
-                    if "rpms" in new_data and new_data["rpms"]:
-                        filtered_rpms = self.handle_outliers(new_data["rpms"], threshold=3.0)
-                        for reading in filtered_rpms:
-                            timestamp = reading[4]
-                            if timestamp > self.last_processed["rpms"]:
-                                self.sensor_data["rpms"].append(reading)
-                                self.last_processed["rpms"] = max(self.last_processed["rpms"], timestamp)
-                    
-                    # Process GPS readings with outlier detection
-                    if "latitude" in new_data and "longitude" in new_data:
-                        lat = float(new_data["latitude"])
-                        lon = float(new_data["longitude"])
-                        timestamp = float(new_data["timestamp"])
-                        
-                        # Skip invalid GPS readings (1000, 1000 indicates no signal)
-                        if lat == 1000 and lon == 1000:
-                            continue
-                        
-                        # Convert GPS to meters from reference point
-                        x, y = self.gps_to_meters(lat, lon)
-                        
-                        # Add to temporary list for outlier detection
-                        gps_reading = [x, y, timestamp]
-                        if len(self.sensor_data["gps"]) > 0:
-                            # Create list with recent GPS readings plus new reading
-                            recent_gps = list(self.sensor_data["gps"])[-4:] + [gps_reading]
-                            filtered_gps = self.handle_outliers(recent_gps, threshold=3.0)
-                            
-                            # If the new reading survived outlier detection, add it
-                            if any(reading[2] == timestamp for reading in filtered_gps):
-                                if timestamp > self.last_processed["gps"]:
-                                    self.sensor_data["gps"].append(gps_reading)
-                                    self.last_processed["gps"] = timestamp
-                        else:
-                            # First GPS reading, add without filtering
-                            self.sensor_data["gps"].append(gps_reading)
-                            self.last_processed["gps"] = timestamp
+                self.process_sensor_data(new_data)
                 
-                # Small sleep to avoid overwhelming the API
-                time.sleep(0.01)
+                # Get latest timestamps from sensor data
+                latest_timestamps = {
+                    sensor: max([reading[-1] for reading in data]) if data else 0
+                    for sensor, data in self.sensor_data.items()
+                }
+                
+                # Use the most recent sensor timestamp
+                current_time = max(latest_timestamps.values()) if latest_timestamps else 0
+                
+                # Skip if not enough time has passed
+                if (self.current_state["timestamp"] is not None and 
+                    (current_time - self.current_state["timestamp"]) < update_threshold):
+                    time.sleep(0.01)  # Small sleep to prevent tight loop
+                    continue
+                
+                # Make a copy of the current state to use for prediction
+                prev_state = copy.deepcopy(self.current_state)
+                
+                # Run prediction step using sensor timestamps
+                self.predict(current_time, prev_state)
+                
+                # Run update step
+                self.update()
+                
+                # Resample particles if needed
+                self.resample()
+                
+                # Update current state estimate from particles
+                self.update_state_estimate()
+                
+                # Record update timestamp even if state doesn't change much
+                self.update_timestamps.append(time.time())
                 
             except Exception as e:
-                self.logger.error(f"Error in data collection: {e}")
+                self.logger.error(f"Error in combined thread: {e}")
                 time.sleep(0.1)  # Sleep on error to prevent tight loop
+    
+    def process_sensor_data(self, new_data):
+        """Process and store sensor data with outlier detection"""
+        # Process accelerometer readings
+        if "accels" in new_data and new_data["accels"]:
+            # Apply outlier detection before storing
+            filtered_accels = self.handle_outliers(new_data["accels"], threshold=3.0)
+            for reading in filtered_accels:
+                timestamp = reading[3]
+                if timestamp > self.last_processed["accels"]:
+                    self.sensor_data["accels"].append(reading)
+                    self.last_processed["accels"] = max(self.last_processed["accels"], timestamp)
+        
+        # Process gyroscope readings
+        if "gyros" in new_data and new_data["gyros"]:
+            filtered_gyros = self.handle_outliers(new_data["gyros"], threshold=3.0)
+            for reading in filtered_gyros:
+                timestamp = reading[3]
+                if timestamp > self.last_processed["gyros"]:
+                    self.sensor_data["gyros"].append(reading)
+                    self.last_processed["gyros"] = max(self.last_processed["gyros"], timestamp)
+        
+        # Process magnetometer readings
+        if "mags" in new_data and new_data["mags"]:
+            filtered_mags = self.handle_outliers(new_data["mags"], threshold=3.0)
+            for reading in filtered_mags:
+                timestamp = reading[3]
+                if timestamp > self.last_processed["mags"]:
+                    self.sensor_data["mags"].append(reading)
+                    self.last_processed["mags"] = max(self.last_processed["mags"], timestamp)
+        
+        # Process wheel encoder (RPM) readings
+        if "rpms" in new_data and new_data["rpms"]:
+            filtered_rpms = self.handle_outliers(new_data["rpms"], threshold=3.0)
+            for reading in filtered_rpms:
+                timestamp = reading[4]
+                if timestamp > self.last_processed["rpms"]:
+                    self.sensor_data["rpms"].append(reading)
+                    self.last_processed["rpms"] = max(self.last_processed["rpms"], timestamp)
+        
+        # Process GPS readings with outlier detection
+        if "latitude" in new_data and "longitude" in new_data:
+            lat = float(new_data["latitude"])
+            lon = float(new_data["longitude"])
+            timestamp = float(new_data["timestamp"])
+            
+            # Skip invalid GPS readings (1000, 1000 indicates no signal)
+            if lat == 1000 and lon == 1000:
+                return
+            
+            # Convert GPS to meters from reference point
+            x, y = self.gps_to_meters(lat, lon)
+            
+            # Add to temporary list for outlier detection
+            gps_reading = [x, y, timestamp]
+            if len(self.sensor_data["gps"]) > 0:
+                # Create list with recent GPS readings plus new reading
+                recent_gps = list(self.sensor_data["gps"])[-4:] + [gps_reading]
+                filtered_gps = self.handle_outliers(recent_gps, threshold=3.0)
+                
+                # If the new reading survived outlier detection, add it
+                if any(reading[2] == timestamp for reading in filtered_gps):
+                    if timestamp > self.last_processed["gps"]:
+                        self.sensor_data["gps"].append(gps_reading)
+                        self.last_processed["gps"] = timestamp
+            else:
+                # First GPS reading, add without filtering
+                self.sensor_data["gps"].append(gps_reading)
+                self.last_processed["gps"] = timestamp
     
     def get_data(self):
         """Fetch data from the robot API"""
@@ -295,49 +339,6 @@ class StateEstimationPF:
         except Exception as e:
             self.logger.error(f"Error fetching data: {e}")
             return None
-    
-    def particle_filter_thread(self):
-        """Thread to run the particle filter algorithm periodically"""
-        update_threshold = 0.05  # 50ms threshold for updates
-        
-        while self.running:
-            try:
-                self.logger.debug("Trying to get data lock")
-                with self.data_lock:
-                    self.logger.debug("Got data lock")
-                    # Get latest timestamps from sensor data
-                    latest_timestamps = {
-                        sensor: max([reading[-1] for reading in data]) if data else 0
-                        for sensor, data in self.sensor_data.items()
-                    }
-                    
-                    # Use the most recent sensor timestamp
-                    current_time = max(latest_timestamps.values()) if latest_timestamps else 0
-                    
-                    # Skip if not enough time has passed
-                    if (self.current_state["timestamp"] is not None and 
-                        (current_time - self.current_state["timestamp"]) < update_threshold):
-                        time.sleep(0.01)  # Small sleep to prevent tight loop
-                        continue
-                    
-                    # Make a copy of the current state to use for prediction
-                    prev_state = copy.deepcopy(self.current_state)
-                
-                # Run prediction step using sensor timestamps
-                self.predict(current_time, prev_state)
-                
-                # Run update step
-                self.update()
-                
-                # Resample particles if needed
-                self.resample()
-                
-                # Update current state estimate from particles
-                self.update_state_estimate()
-                
-            except Exception as e:
-                self.logger.error(f"Error in particle filter thread: {e}")
-                time.sleep(0.1)  # Sleep on error to prevent tight loop
     
     def predict(self, current_time, prev_state):
         """
@@ -359,11 +360,10 @@ class StateEstimationPF:
         # Calculate time-dependent noise scaling (more noise for longer intervals)
         noise_scale = min(5.0, max(1.0, time_diff))
         
-        with self.data_lock:
-            # Get relevant sensor data between prev_time and current_time
-            accel_data = [a for a in self.sensor_data["accels"] if prev_time < a[3] <= current_time]
-            gyro_data = [g for g in self.sensor_data["gyros"] if prev_time < g[3] <= current_time]
-            rpm_data = [r for r in self.sensor_data["rpms"] if prev_time < r[4] <= current_time]
+        # Get relevant sensor data between prev_time and current_time
+        accel_data = [a for a in self.sensor_data["accels"] if prev_time < a[3] <= current_time]
+        gyro_data = [g for g in self.sensor_data["gyros"] if prev_time < g[3] <= current_time]
+        rpm_data = [r for r in self.sensor_data["rpms"] if prev_time < r[4] <= current_time]
         
         # Extract current particle states
         theta = self.particles[:, 2]
@@ -372,6 +372,20 @@ class StateEstimationPF:
         delta_x = np.zeros(self.num_particles)
         delta_y = np.zeros(self.num_particles)
         delta_theta = np.zeros(self.num_particles)
+        
+        # Calculate if robot is moving based on RPM and IMU data
+        is_moving = False
+        if rpm_data:
+            # Check if any RPM readings indicate movement
+            for rpm in rpm_data:
+                if abs(rpm[0]) > 0.1 or abs(rpm[1]) > 0.1:  # Small threshold for RPM
+                    is_moving = True
+                    break
+
+        # Adjust noise scale based on movement state
+        if not is_moving:
+            # Reduce noise when stationary
+            noise_scale *= 0.2  # Apply 80% reduction to noise when stationary
         
         # Process wheel encoder data if available
         if rpm_data:
@@ -495,10 +509,9 @@ class StateEstimationPF:
     
     def update(self):
         """Vectorized measurement update step using GPS and compass data"""
-        with self.data_lock:
-            # Get the latest GPS and magnetometer readings
-            latest_gps = self.get_latest_sensor_data("gps")
-            latest_mag = self.get_latest_sensor_data("mags")
+        # Get the latest GPS and magnetometer readings
+        latest_gps = self.get_latest_sensor_data("gps")
+        latest_mag = self.get_latest_sensor_data("mags")
         
         # Skip update if no measurements are available
         if not latest_gps and not latest_mag:
@@ -604,8 +617,18 @@ class StateEstimationPF:
         return self.sensor_data[sensor_type][-1]
     
     def get_state(self):
-        """Return the current state estimate"""
-        return copy.deepcopy(self.current_state)
+        """Return the current state estimate with additional GPS information"""
+        state = copy.deepcopy(self.current_state)
+        
+        # Add the absolute GPS coordinates if we have a valid state
+        if state["x"] is not None and state["y"] is not None and self.ref_lat is not None and self.ref_lon is not None:
+            lat, lon = self.reverse_ned_to_latlon(state["x"], state["y"])
+            state["latitude"] = lat
+            state["longitude"] = lon
+            state["ref_latitude"] = self.ref_lat
+            state["ref_longitude"] = self.ref_lon
+        
+        return state
     
     def normalize_angle(self, angle):
         """Normalize angle to be between -pi and pi"""
@@ -653,9 +676,15 @@ class StateEstimationPF:
     def gps_to_meters(self, lat, lon):
         """Convert GPS coordinates to meters in NED frame using pyproj"""
         if self.ref_lat is None or self.ref_lon is None:
+            # Store the reference coordinates
             self.ref_lat = lat
             self.ref_lon = lon
             self.setup_projection()
+            
+            # Log the reference coordinates
+            self.logger.info(f"Setting GPS reference point: Lat {lat}, Lon {lon}")
+            
+            # Still return 0,0 as this is our reference point
             return 0, 0
         
         if self.proj is None:
@@ -764,6 +793,7 @@ class StateEstimationPF:
         Returns:
             frequency: Particle filter update frequency in Hz, or 0 if insufficient data
         """
+        
         if len(self.update_timestamps) < 2:
             return 0.0  # Not enough data to calculate frequency
         
@@ -781,7 +811,8 @@ class StateEstimationPF:
         
         # Calculate frequency (Hz)
         if avg_time_diff > 0:
-            return 1.0 / avg_time_diff
+            freq = 1.0 / avg_time_diff
+            return freq
         else:
             return 0.0  # Avoid division by zero
 
@@ -802,7 +833,20 @@ if __name__ == "__main__":
         while True:
             # Get current state estimate
             state = pf.get_state()
-            print(f"Position: ({state['x']:.2f}, {state['y']:.2f}), Heading: {math.degrees(state['theta']):.2f}°")
+            
+            # Check if state values are initialized
+            if state['x'] is not None and state['y'] is not None and state['theta'] is not None:
+                print(f"Position (NED): ({state['x']:.2f}, {state['y']:.2f}), Heading: {math.degrees(state['theta']):.2f}°")
+                
+                # Display absolute GPS coordinates if available
+                if 'latitude' in state and 'longitude' in state:
+                    print(f"GPS: Lat {state['latitude']:.6f}, Lon {state['longitude']:.6f}")
+                    print(f"Reference: Lat {state['ref_latitude']:.6f}, Lon {state['ref_longitude']:.6f}")
+
+                print(f"Frequency: {pf.get_data_fetching_frequency():.2f} Hz, Particle Filter: {pf.get_particle_filter_frequency():.2f} Hz")
+            else:
+                print("Waiting for state initialization...")
+                
             time.sleep(1.0)
     except KeyboardInterrupt:
         # Stop the particle filter on Ctrl+C

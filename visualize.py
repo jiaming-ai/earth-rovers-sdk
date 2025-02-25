@@ -53,6 +53,7 @@ class ParticleFilterVisualizer:
         self.dragging = False
         self.drag_start = None
         self.drag_offset = (0, 0)
+        self.free_navigation_mode = False  # Track if we're in free navigation mode
         
         # Performance tracking
         self.update_times = deque(maxlen=30)  # Store last 30 update times
@@ -110,6 +111,13 @@ class ParticleFilterVisualizer:
         """Handle mouse events for dragging and zooming"""
         try:
             if event == cv2.EVENT_LBUTTONDOWN:
+                # Check if the recenter button was clicked
+                if self.free_navigation_mode and 10 <= x <= 130 and 50 <= y <= 90:
+                    logger.debug("Recenter button clicked")
+                    self.free_navigation_mode = False
+                    self.drag_offset = (0, 0)
+                    return
+                    
                 self.dragging = True
                 self.drag_start = (x, y)
                 logger.debug("Mouse drag started at (%d, %d)", x, y)
@@ -128,11 +136,16 @@ class ParticleFilterVisualizer:
                     dy = self._pixels_to_meters(self.drag_offset[1])
                     
                     # Update center (in NED frame, y is north, x is east)
+                    # Reverse the direction to make dragging more intuitive
+                    # When dragging left, we want to see what's to the right
                     center_lat, center_lon = self.current_center
-                    new_lat, new_lon = self._offset_latlon(center_lat, center_lon, -dy, -dx)
+                    new_lat, new_lon = self._offset_latlon(center_lat, center_lon, dy, dx)
                     
                     self._update_map_image(new_lat, new_lon)
                     self.current_center = (new_lat, new_lon)
+                    
+                    # Set free navigation mode
+                    self.free_navigation_mode = True
                     
                     # Reset drag offset
                     self.drag_offset = (0, 0)
@@ -144,20 +157,28 @@ class ParticleFilterVisualizer:
                     dy = y - self.drag_start[1]
                     self.drag_offset = (dx, dy)
             
+            # Fix for mouse wheel zoom
             elif event == cv2.EVENT_MOUSEWHEEL:
-                # Handle zoom with ctrl key
+                # Extract wheel direction from flags
+                wheel_direction = np.sign(flags)
+                logger.debug(f"Mouse wheel event detected, direction: {wheel_direction}, flags: {flags}")
+                
+                # Check if Ctrl key is pressed
                 if flags & cv2.EVENT_FLAG_CTRLKEY:
-                    wheel_direction = np.sign(flags >> 16)  # Extract wheel direction
+                    # Store the current center before changing zoom
+                    old_zoom = self.zoom_level
                     
-                    if wheel_direction < 0:  # Zoom in
+                    if wheel_direction < 0:  # Zoom out
+                        self.zoom_level = max(10, self.zoom_level - 1)  # Lower minimum to 10 or another value
+                        logger.info(f"Zooming out to level {self.zoom_level}")
+                    else:  # Zoom in
                         self.zoom_level = min(21, self.zoom_level + 1)
-                        logger.debug("Zooming in to level %d", self.zoom_level)
-                    else:  # Zoom out
-                        self.zoom_level = max(14, self.zoom_level - 1)
-                        logger.debug("Zooming out to level %d", self.zoom_level)
+                        logger.info(f"Zooming in to level {self.zoom_level}")
                     
                     # Update map with new zoom level if we have a center
-                    if self.current_center:
+                    if self.current_center and old_zoom != self.zoom_level:
+                        # Clear the map cache when zoom level changes
+                        self.map_cache.clear()
                         self._update_map_image(self.current_center[0], self.current_center[1])
         
         except Exception as e:
@@ -193,121 +214,18 @@ class ParticleFilterVisualizer:
         
         return new_lat, new_lon
 
-    # def _update_loop(self):
-    #     """Main update loop for visualization"""
-    #     logger.info("Starting visualization update loop")
-    #     last_frame_time = time.time()
-    #     error_count = 0
-        
-    #     while self.running:
-    #         try:
-    #             # Emergency exit if too many errors
-    #             if error_count > 10:
-    #                 logger.error("Too many errors, shutting down visualization")
-    #                 self.running = False
-    #                 break
-                
-    #             # Limit frame rate to prevent excessive CPU usage
-    #             current_time = time.time()
-    #             elapsed = current_time - last_frame_time
-                
-    #             if elapsed < self.update_interval:
-    #                 # Wait for the remaining time to achieve target frame rate
-    #                 time.sleep(max(0, self.update_interval - elapsed))
-    #                 continue
-                
-    #             last_frame_time = current_time
-    #             logger.debug(f"Update loop iteration at {current_time:.3f}")
-                
-    #             # Calculate update frequency
-    #             self.update_times.append(current_time)
-                
-    #             if len(self.update_times) >= 2:
-    #                 # Calculate updates per second over the tracked period
-    #                 time_span = self.update_times[-1] - self.update_times[0]
-    #                 if time_span > 0:
-    #                     self.update_frequency = (len(self.update_times) - 1) / time_span
-                
-    #             # Get the state from particle filter (with timeout protection)
-    #             try:
-    #                 state = self.pf.get_state()
-    #                 logger.debug(f"Get state from PF: {state}")
-    #                 if state is None or not all(k in state for k in ['x', 'y', 'theta']):
-    #                     logger.debug("Invalid state from particle filter")
-    #                     self._show_waiting_image("Waiting for valid state...")
-    #                     time.sleep(0.1)
-    #                     continue
-    #             except Exception as e:
-    #                 logger.error(f"Error getting state: {e}")
-    #                 self._show_waiting_image("Error getting state")
-    #                 time.sleep(0.1)
-    #                 continue
-                
-    #             # Safe update display
-    #             try:
-    #                 self._update_display_safe(state)
-    #             except Exception as e:
-    #                 logger.error(f"Error updating display: {e}")
-    #                 error_count += 1
-    #                 traceback.print_exc()
-    #                 time.sleep(0.1)
-    #                 continue
-                
-    #             # Process key events with a very short timeout
-    #             try:
-    #                 key = cv2.waitKey(1) & 0xFF
-    #                 if key == 27:  # ESC key
-    #                     logger.info("ESC key pressed, exiting...")
-    #                     self.running = False
-    #                     break
-    #             except Exception as e:
-    #                 logger.error(f"Error processing key events: {e}")
-    #                 error_count += 1
-                
-    #             # Reset error count on successful iteration
-    #             error_count = 0
-                
-    #         except Exception as e:
-    #             logger.error(f"Critical error in visualization update loop: {e}")
-    #             traceback.print_exc()
-    #             error_count += 1
-    #             time.sleep(0.5)  # Longer sleep on critical error
-                
-    #     logger.info("Visualization update loop terminated")
-
-    def _draw_text_with_background(self, img, text, position, font_scale=0.7, thickness=1, 
-                                  text_color=(255, 255, 255), bg_color=(0, 0, 0, 180)):
-        """Draw text with a semi-transparent background"""
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
-        
-        # Create background rectangle with padding
-        padding = 5
-        bg_rect = (position[0], position[1] - text_size[1] - padding, 
-                  text_size[0] + padding * 2, text_size[1] + padding * 2)
-        
-        # Create overlay for semi-transparent background
-        overlay = img.copy()
-        cv2.rectangle(overlay, (bg_rect[0], bg_rect[1]), 
-                     (bg_rect[0] + bg_rect[2], bg_rect[1] + bg_rect[3]), 
-                     bg_color[:3], -1)
-        
-        # Apply transparency
-        alpha = bg_color[3] / 255.0
-        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-        
-        # Draw text
-        text_position = (position[0] + padding, position[1] - padding)
-        cv2.putText(img, text, text_position, font, font_scale, text_color, thickness)
-        
-        return text_size[1] + padding * 2
-
     def _draw_robot_triangle(self, img, position, heading, size=15, color=(0, 255, 0), thickness=2):
         """Draw the robot as a triangle pointing in the heading direction"""
         x, y = position
         
+        # Check if heading is None and provide a default value
+        if heading is None:
+            logger.warning("Received None heading, using 0 as default")
+            angle = 0.0
+        else:
+            angle = heading
+        
         # Calculate triangle points
-        angle = heading
         pt1 = (int(x + size * math.cos(angle)), int(y + size * math.sin(angle)))
         pt2 = (int(x + size/2 * math.cos(angle + 2.5)), int(y + size/2 * math.sin(angle + 2.5)))
         pt3 = (int(x + size/2 * math.cos(angle - 2.5)), int(y + size/2 * math.sin(angle - 2.5)))
@@ -324,8 +242,9 @@ class ParticleFilterVisualizer:
         """Draw a particle as an arrow showing its position and heading"""
         x, y = position
         
+        base_length = 20
         # Scale arrow length based on weight
-        arrow_length = max(5, int(10 * weight))
+        arrow_length = max(10, int(base_length * weight))
         
         # Calculate arrow endpoint
         end_x = int(x + arrow_length * math.cos(heading))
@@ -338,6 +257,12 @@ class ParticleFilterVisualizer:
         """Update the visualization with current state - safer version"""
         # Step 1: Get base map image
         try:
+            # Ensure state has valid values
+            for key in ['x', 'y', 'theta']:
+                if key not in state or state[key] is None:
+                    logger.warning(f"Missing or None value for {key} in state, using 0 as default")
+                    state[key] = 0.0
+                
             # Convert NED coordinates to lat/lon
             lat, lon = self.pf.reverse_ned_to_latlon(state['x'], state['y'])
             state['lat'] = lat
@@ -356,7 +281,11 @@ class ParticleFilterVisualizer:
                 if self.dragging:
                     map_img = self.canvas.copy()
                 else:
-                    map_img = self._get_map_tile_cached(lat, lon)
+                    # Only update the map center if not in free navigation mode
+                    if not self.free_navigation_mode:
+                        self.current_center = (lat, lon)
+                        self._update_map_image(lat, lon)
+                    map_img = self._get_map_tile_cached(self.current_center[0], self.current_center[1])
         except Exception as e:
             logger.error(f"Error preparing map: {e}")
             map_img = self._create_blank_map()
@@ -368,8 +297,12 @@ class ParticleFilterVisualizer:
         
         # Step 2: Draw particles, robot position, and info overlay if needed
         self._draw_particles_safe(display_img, state)
+        
+        # Draw the robot position
         x_pixel, y_pixel = self._latlon_to_pixel(state['lat'], state['lon'])
         self._draw_robot_triangle(display_img, (x_pixel, y_pixel), state['theta'])
+        
+        # Draw info overlay
         self._draw_info_overlay(display_img, state)
         logger.debug("Drew particles, robot position, and info overlay")
         
@@ -379,9 +312,10 @@ class ParticleFilterVisualizer:
     
     def _draw_particles_safe(self, display_img, state):
         """Draw particles on the display image - safer version"""
-        uncertainty = self._calculate_uncertainty()
+        ps, hs = self.pf.get_uncertainty()
+        total_uncertainty = ps + hs
         
-        if uncertainty <= 0.5 or not hasattr(self.pf, 'particles') or self.pf.particles is None or not hasattr(self.pf, 'weights'):
+        if total_uncertainty <= 0.5 or not hasattr(self.pf, 'particles') or self.pf.particles is None or not hasattr(self.pf, 'weights'):
             return
         
         try:
@@ -423,26 +357,31 @@ class ParticleFilterVisualizer:
     def _draw_info_overlay(self, display_img, state):
         """Draw information overlay - safer version"""
         # Calculate uncertainty
-        uncertainty = self._calculate_uncertainty()
+        ps, hs = self.pf.get_uncertainty()
+        hs_deg = math.degrees(hs)
         
         # Create info text
         info_text = [
             f"Position: ({state['x']:.2f}m, {state['y']:.2f}m)",
-            f"Heading: {math.degrees(state['theta']):.1f}°"
+            f"Heading: {math.degrees(state['theta']):.1f} deg"
         ]
         
         # Add GPS info if available
         if 'lat' in state and 'lon' in state:
             info_text.append(f"GPS: ({state['lat']:.6f}, {state['lon']:.6f})")
         
-        info_text.append(f"Update rate: {self.update_frequency:.1f} Hz")
-        info_text.append(f"Uncertainty: {uncertainty:.2f}")
+        # Add data rate info
+        data_rate = self.pf.get_data_fetching_frequency() or 0
+        pf_rate = self.pf.get_particle_filter_frequency() or 0
+        info_text.append(f"Data rate: {data_rate:.1f} Hz")
+        info_text.append(f"PF update rate: {pf_rate:.1f} Hz")
+        info_text.append(f"Std: {ps:.2f}m, {hs_deg:.2f}deg")
         
         # Draw semi-transparent background
-        info_box_width = 250
-        info_box_padding = 15
-        info_box_height = len(info_text) * 25 + info_box_padding * 2
-        
+        info_box_width = 300
+        info_box_padding = 10
+        line_space = 25
+        info_box_height = len(info_text) * line_space + info_box_padding * 2
         try:
             # Create a simple solid background instead of using addWeighted
             cv2.rectangle(display_img, 
@@ -451,22 +390,48 @@ class ParticleFilterVisualizer:
                          (0, 0, 0), -1)
             
             # Draw text
+            font_scale = 0.5
+            font_thickness = 1
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_color = (255, 255, 255)
             for i, text in enumerate(info_text):
+                position = (self.map_size[0] - info_box_width + 5, info_box_padding + line_space + i * line_space)
                 cv2.putText(display_img, text, 
-                           (self.map_size[0] - info_box_width + 5, info_box_padding + 25 + i * 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                           position, 
+                           font, 
+                           font_scale, 
+                           font_color, 
+                           font_thickness)
         except Exception as e:
             logger.error(f"Error drawing info box: {e}")
         
-        # Draw drag indicator if dragging
-        if self.dragging:
-            cv2.putText(display_img, "Dragging...", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # Draw drag indicator and recenter button if in free navigation mode
+        if self.free_navigation_mode:
+            # Show different messages depending on whether actively dragging
+            if self.dragging:
+                cv2.putText(display_img, "Dragging Map...", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                cv2.putText(display_img, "Free Navigation Mode", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Draw recenter button
+            button_width = 120
+            button_height = 40
+            button_x = 10
+            button_y = 50
+            cv2.rectangle(display_img, 
+                         (button_x, button_y), 
+                         (button_x + button_width, button_y + button_height), 
+                         (0, 120, 255), -1)
+            cv2.putText(display_img, "Recenter", 
+                       (button_x + 10, button_y + 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    def _calculate_uncertainty(self):
-        """Calculate the uncertainty of the particle filter"""
-        ps, hs = self.pf.get_uncertainty()
-        return ps
+    # def _calculate_uncertainty(self):
+    #     """Calculate the uncertainty of the particle filter"""
+    #     ps, hs = self.pf.get_uncertainty()
+    #     return ps
     def _create_blank_map(self):
         """Create a blank map with grid lines"""
         blank_map = np.ones((self.map_size[0], self.map_size[1], 3), dtype=np.uint8) * 240
@@ -544,40 +509,55 @@ class ParticleFilterVisualizer:
     def _fetch_map_tile(self, lat, lon, xtile, ytile, cache_key):
         """Fetch a map tile in background thread"""
         try:
-            # Construct URL
-            url = f"https://tile.openstreetmap.org/{self.zoom_level}/{xtile}/{ytile}.png"
-            logger.debug(f"Background fetch of map tile from {url}")
+            # Construct URL - try alternative tile servers
+            servers = [
+                f"https://a.tile.openstreetmap.org/{self.zoom_level}/{xtile}/{ytile}.png",
+                f"https://b.tile.openstreetmap.org/{self.zoom_level}/{xtile}/{ytile}.png",
+                f"https://c.tile.openstreetmap.org/{self.zoom_level}/{xtile}/{ytile}.png"
+            ]
             
-            # Add timeout to prevent hanging indefinitely
-            response = requests.get(url, 
-                                  headers={'User-Agent': 'ParticleFilterVisualizer/1.0'},
-                                  timeout=3.0)  # 3 second timeout
+            # Try each server until one works
+            for url in servers:
+                try:
+                    logger.debug(f"Fetching map tile from {url}")
+                    
+                    # Add timeout to prevent hanging indefinitely
+                    response = requests.get(url, 
+                                          headers={'User-Agent': 'ParticleFilterVisualizer/1.0 (https://yourwebsite.com)'},
+                                          timeout=5.0)  # Increased timeout
+                    
+                    if response.status_code == 200:
+                        img = Image.open(BytesIO(response.content))
+                        img = img.resize(self.map_size)
+                        map_img = np.array(img)
+                        # Convert RGB to BGR (OpenCV format)
+                        map_img = cv2.cvtColor(map_img, cv2.COLOR_RGB2BGR)
+                        
+                        # Cache the result (with size limit)
+                        if len(self.map_cache) >= self.max_cache_size:
+                            # Remove oldest key (first key)
+                            oldest_key = next(iter(self.map_cache))
+                            del self.map_cache[oldest_key]
+                        
+                        self.map_cache[cache_key] = map_img
+                        # Update canvas for next rendering
+                        self.canvas = map_img
+                        return True
+                    else:
+                        logger.warning(f"Failed to get map tile from {url}: HTTP {response.status_code}")
+                        # Continue to next server
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Map tile request timed out for {url}")
+                    # Continue to next server
+                except Exception as e:
+                    logger.warning(f"Error getting map tile from {url}: {e}")
+                    # Continue to next server
             
-            if response.status_code == 200:
-                img = Image.open(BytesIO(response.content))
-                img = img.resize(self.map_size)
-                map_img = np.array(img)
-                # Convert RGB to BGR (OpenCV format)
-                map_img = cv2.cvtColor(map_img, cv2.COLOR_RGB2BGR)
-                
-                # Cache the result (with size limit)
-                if len(self.map_cache) >= self.max_cache_size:
-                    # Remove oldest item (first key)
-                    oldest_key = next(iter(self.map_cache))
-                    del self.map_cache[oldest_key]
-                
-                self.map_cache[cache_key] = map_img
-                # Update canvas for next rendering
-                self.canvas = map_img
-                return True
-            else:
-                logger.warning(f"Failed to get map tile: HTTP {response.status_code}")
-                return False
-        except requests.exceptions.Timeout:
-            logger.warning("Map tile request timed out")
+            # If we get here, all servers failed
+            logger.error("All map tile servers failed")
             return False
         except Exception as e:
-            logger.error(f"Error getting map tile: {e}")
+            logger.error(f"Unexpected error in map tile fetching: {e}")
             return False
 
     def _latlon_to_pixel(self, lat, lon):
@@ -616,6 +596,39 @@ class ParticleFilterVisualizer:
         c = 2 * math.asin(math.sqrt(a))
         
         return R * c
+
+    # Add a new method to pre-fetch surrounding tiles
+    def _prefetch_surrounding_tiles(self, center_lat, center_lon):
+        """Pre-fetch surrounding tiles to improve map navigation experience"""
+        try:
+            # Calculate center tile
+            n = 2.0 ** self.zoom_level
+            center_xtile = int((center_lon + 180.0) / 360.0 * n)
+            center_ytile = int((1.0 - math.log(math.tan(math.radians(center_lat)) + 1.0 / math.cos(math.radians(center_lat))) / math.pi) / 2.0 * n)
+            
+            # Queue fetching of surrounding tiles (3x3 grid)
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    # Skip center tile as it's already being fetched
+                    if dx == 0 and dy == 0:
+                        continue
+                        
+                    xtile = center_xtile + dx
+                    ytile = center_ytile + dy
+                    
+                    # Calculate lat/lon for this tile
+                    lon_deg = xtile / n * 360.0 - 180.0
+                    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
+                    lat_deg = math.degrees(lat_rad)
+                    
+                    cache_key = f"{xtile}_{ytile}_{self.zoom_level}"
+                    
+                    # Only fetch if not already in cache
+                    if cache_key not in self.map_cache:
+                        # Use low priority thread to fetch
+                        self.thread_pool.submit(self._fetch_map_tile, lat_deg, lon_deg, xtile, ytile, cache_key)
+        except Exception as e:
+            logger.error(f"Error in prefetch: {e}")
 
 
 def main():
@@ -656,6 +669,21 @@ def main():
     
     try:
         while viz.running:
+
+            # first wait the pf to be initialized
+            
+            try:
+                if not viz.pf.is_initialized:
+                    logger.debug("Particle filter is not initialized")
+                    viz._show_waiting_image("Waiting for particle filter to be initialized...")
+                    time.sleep(0.1)
+                    continue
+            except Exception as e:
+                logger.error(f"Error getting state: {e}")
+                viz._show_waiting_image("Error getting state")
+                time.sleep(0.1)
+                continue
+            
             # Emergency exit if too many errors
             if error_count > 10:
                 logger.error("Too many errors, shutting down visualization")
