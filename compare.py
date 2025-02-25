@@ -36,7 +36,6 @@ def read_csv_data(file_path, data_type):
                 if len(row) < 4:  # Ensure we have enough columns
                     continue
                 
-                timestamp = float(row[3])  # Last column is timestamp
                 
                 # Extract compass data (magnetometer)
                 compass_str = row[0]
@@ -51,6 +50,7 @@ def read_csv_data(file_path, data_type):
                         x = float(compass_values[0].replace('"', ''))
                         y = float(compass_values[1].replace('"', ''))
                         z = float(compass_values[2].replace('"', ''))
+                        timestamp = float(compass_values[3].replace('"', ''))  # Last column is timestamp
                         
                         data.append({
                             'timestamp': timestamp,
@@ -67,16 +67,19 @@ def read_csv_data(file_path, data_type):
             reader = csv.DictReader(f)
             
             for row in reader:
-                entry = {'timestamp': float(row['timestamp'])}
+                entry = {}
                 
                 if data_type == 'gps':
                     entry['latitude'] = float(row['latitude'])
                     entry['longitude'] = float(row['longitude'])
+                    entry['timestamp'] = float(row['timestamp'])/1000
+
                 elif data_type == 'rpm':
                     entry['rpm_1'] = float(row['rpm_1'])
                     entry['rpm_2'] = float(row['rpm_2'])
                     entry['rpm_3'] = float(row['rpm_3'])
                     entry['rpm_4'] = float(row['rpm_4'])
+                    entry['timestamp'] = float(row['timestamp'])/1000
                     
                 data.append(entry)
     
@@ -537,6 +540,13 @@ def visualize_headings(gps_data, heading_data, output_path, title="Compass Headi
     
     if not matched_data:
         print(f"Warning: No matching data points found for {title}")
+        # Create a blank image with error message
+        plt.figure(figsize=(12, 10))
+        plt.text(0.5, 0.5, f"No matching data points found for {title}", 
+                ha='center', va='center', fontsize=16)
+        plt.axis('off')
+        plt.savefig(output_path, dpi=300)
+        plt.close()
         return
     
     # Extract data for plotting
@@ -578,11 +588,17 @@ def visualize_headings(gps_data, heading_data, output_path, title="Compass Headi
     
     # Build title with metrics if provided
     if metrics:
-        metrics_text = (
-            f"\nMean Error: {metrics.get('mean_error', 'N/A'):.2f}°, "
-            f"Median: {metrics.get('median_error', 'N/A'):.2f}°, "
-            f"Max: {metrics.get('max_error', 'N/A'):.2f}°"
-        )
+        # Handle potentially NaN or missing metrics
+        mean_error = metrics.get('mean_error', float('nan'))
+        median_error = metrics.get('median_error', float('nan'))
+        max_error = metrics.get('max_error', float('nan'))
+        
+        # Format as strings with error handling
+        mean_str = f"{mean_error:.2f}°" if not math.isnan(mean_error) else "N/A"
+        median_str = f"{median_error:.2f}°" if not math.isnan(median_error) else "N/A"
+        max_str = f"{max_error:.2f}°" if not math.isnan(max_error) else "N/A"
+        
+        metrics_text = f"\nMean Error: {mean_str}, Median: {median_str}, Max: {max_str}"
         title = title + metrics_text
     
     plt.title(title)
@@ -595,7 +611,7 @@ def visualize_headings(gps_data, heading_data, output_path, title="Compass Headi
     # Save figure
     plt.savefig(output_path, dpi=300)
     plt.close()
-
+    
 def create_combined_visualization(gps_data, results, output_path):
     """
     Create a combined visualization of all calibration methods
@@ -707,12 +723,34 @@ def create_metrics_comparison(results, output_path):
     median_errors = []
     max_errors = []
     
+    valid_data = False  # Flag to check if any valid data exists
+    
     for method_name, method_results in results.items():
         metrics = method_results['metrics']
+        
+        # Get metrics with safe fallback
+        mean_error = metrics.get('mean_error', float('nan'))
+        median_error = metrics.get('median_error', float('nan'))
+        max_error = metrics.get('max_error', float('nan'))
+        
+        # Check if we have at least one valid metric
+        if not (math.isnan(mean_error) and math.isnan(median_error) and math.isnan(max_error)):
+            valid_data = True
+        
         methods.append(method_name)
-        mean_errors.append(metrics.get('mean_error', 0))
-        median_errors.append(metrics.get('median_error', 0))
-        max_errors.append(metrics.get('max_error', 0))
+        mean_errors.append(mean_error if not math.isnan(mean_error) else 0)
+        median_errors.append(median_error if not math.isnan(median_error) else 0)
+        max_errors.append(max_error if not math.isnan(max_error) else 0)
+    
+    # If all metrics are NaN, create a message plot instead of bar chart
+    if not valid_data:
+        plt.figure(figsize=(12, 8))
+        plt.text(0.5, 0.5, "No valid metrics available for comparison", 
+                ha='center', va='center', fontsize=16)
+        plt.axis('off')
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+        return
     
     # Create DataFrame for plotting
     df = pd.DataFrame({
@@ -742,7 +780,11 @@ def create_metrics_comparison(results, output_path):
     plt.title('Compass Calibration Error Comparison', fontsize=16)
     plt.xlabel('Calibration Method', fontsize=12)
     plt.ylabel('Error (degrees)', fontsize=12)
-    plt.ylim(0, max(max_errors) * 1.1)  # Add some headroom
+    
+    # Set y-limit with safety check
+    y_max = max(max_errors) if max_errors and max(max_errors) > 0 else 10
+    plt.ylim(0, y_max * 1.1)  # Add some headroom
+    
     plt.legend(title='Metric')
     
     # Rotate x-axis labels if needed

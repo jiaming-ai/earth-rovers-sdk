@@ -20,9 +20,10 @@ class CompassCalibrator:
     - Kalman filtering with sensor fusion for smoothed outputs
     """
     
-    def __init__(self, min_speed_threshold=1.0, max_heading_change_rate=45.0, 
+    def __init__(self, min_speed_threshold=0.1, max_heading_change_rate=45.0, 
                  outlier_threshold=3.0, time_alignment_threshold=0.5,
-                 use_kalman_filter=True, wheel_diameter=130, wheel_base=200):
+                 use_kalman_filter=True, wheel_diameter=130, wheel_base=200,
+                 use_ellipsoid_fit=True):
         """
         Initialize the compass calibrator
         
@@ -40,6 +41,7 @@ class CompassCalibrator:
         self.outlier_threshold = outlier_threshold
         self.time_alignment_threshold = time_alignment_threshold
         self.use_kalman_filter = use_kalman_filter
+        self.use_ellipsoid_fit = use_ellipsoid_fit
         
         # Wheel parameters for RPM calculations (convert to meters)
         self.wheel_diameter = wheel_diameter / 1000.0  # mm to m
@@ -66,8 +68,11 @@ class CompassCalibrator:
         # Step 1: Perform ellipsoid fitting on magnetometer data
         self.ellipsoid_params = self._perform_ellipsoid_fitting(mag_data)
         
-        # Apply initial ellipsoid calibration to magnetometer data
-        mag_data_calibrated = self._apply_ellipsoid_calibration(mag_data)
+        if self.use_ellipsoid_fit:
+            # Apply initial ellipsoid calibration to magnetometer data
+            mag_data_calibrated = self._apply_ellipsoid_calibration(mag_data)
+        else:
+            mag_data_calibrated = mag_data
         
         # Step 2: Preprocess and align data
         aligned_data = self._align_timestamps(gps_data, mag_data_calibrated, rpm_data)
@@ -115,6 +120,36 @@ class CompassCalibrator:
         
         return calibrated_headings
     
+    def _get_ellipsoid_params(self, A, offset):
+        """
+        Extract ellipsoid parameters from matrix form
+        
+        Args:
+            A: 3x3 quadratic form matrix
+            offset: center of ellipsoid
+            
+        Returns:
+            T: transformation matrix, radii: squared radii of ellipsoid
+        """
+        # Get eigenvalues and eigenvectors
+        eigvals, eigvecs = eigh(A)
+        
+        # Handle negative eigenvalues - take absolute values
+        # This makes the fit more like an ellipsoid even if the data suggests a hyperboloid
+        eigvals = np.abs(eigvals)
+        
+        # Add a small epsilon to avoid division by very small numbers
+        epsilon = 1e-10
+        safe_eigvals = np.maximum(eigvals, epsilon)
+        
+        # Radii are inversely proportional to the square root of eigenvalues
+        radii = 1.0 / safe_eigvals
+        
+        # Transform matrix from ellipsoid to sphere
+        T = eigvecs
+        
+        return T, radii
+
     def _perform_ellipsoid_fitting(self, mag_data):
         """
         Perform ellipsoid fitting to calibrate magnetometer data
@@ -147,13 +182,25 @@ class CompassCalibrator:
             
             # Center (hard iron offset)
             v = np.array([S[6], S[7], S[8]])
-            offset = -np.linalg.inv(A).dot(v) / 2
+            
+            # Check if A is invertible
+            try:
+                A_inv = np.linalg.inv(A)
+                offset = -A_inv.dot(v) / 2
+            except np.linalg.LinAlgError:
+                # If A is not invertible, use pseudo-inverse
+                A_pinv = np.linalg.pinv(A)
+                offset = -A_pinv.dot(v) / 2
             
             # Get the radii and transformation matrix
             T, radii = self._get_ellipsoid_params(A, offset)
             
-            # Normalize to get a sphere
-            R = np.diag(1/np.sqrt(radii))
+            # Ensure radii is positive for sqrt calculation
+            radii_sqrt = np.sqrt(np.abs(radii))
+            
+            # Normalize to get a sphere (avoid division by zero)
+            epsilon = 1e-10
+            R = np.diag(1.0 / np.maximum(radii_sqrt, epsilon))
             
             # Combined transformation
             W = R.dot(T)
@@ -398,13 +445,15 @@ class CompassCalibrator:
         Returns:
             Data with GPS headings and speeds added
         """
+        # Define minimum distance threshold to filter noise
+        min_distance_threshold = 0.1  # meters
+        
         for i in range(1, len(aligned_data)):
             prev_entry = aligned_data[i-1]
             curr_entry = aligned_data[i]
             
-            # Skip if either entry has interpolated GPS data or missing GPS data
-            if (prev_entry.get('is_interpolated_gps', True) or curr_entry.get('is_interpolated_gps', True) or
-                'latitude' not in prev_entry or 'longitude' not in prev_entry or
+            # Skip only if GPS data is missing, but ALLOW interpolated data
+            if ('latitude' not in prev_entry or 'longitude' not in prev_entry or
                 'latitude' not in curr_entry or 'longitude' not in curr_entry or
                 prev_entry['latitude'] is None or prev_entry['longitude'] is None or
                 curr_entry['latitude'] is None or curr_entry['longitude'] is None):
@@ -419,6 +468,15 @@ class CompassCalibrator:
             lat1, lon1 = math.radians(prev_entry['latitude']), math.radians(prev_entry['longitude'])
             lat2, lon2 = math.radians(curr_entry['latitude']), math.radians(curr_entry['longitude'])
             
+            # Calculate distance using haversine formula
+            a = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            distance = 6371000 * c  # Earth radius in meters
+            
+            # Skip if distance is too small (noise)
+            if distance < min_distance_threshold:
+                continue
+            
             # Calculate heading
             y = math.sin(lon2 - lon1) * math.cos(lat2)
             x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(lon2 - lon1)
@@ -427,11 +485,6 @@ class CompassCalibrator:
             # Convert to degrees and normalize to 0-360
             heading = math.degrees(heading)
             heading = (heading + 360) % 360
-            
-            # Calculate distance using haversine formula
-            a = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-            distance = 6371000 * c  # Earth radius in meters
             
             # Calculate speed
             speed = distance / time_diff
@@ -573,6 +626,10 @@ class CompassCalibrator:
         Returns:
             Cleaned data without outliers
         """
+        # Increase outlier threshold to allow more data
+        local_outlier_threshold = 5.0  # Increased from 3.0
+        local_max_change_rate = 90.0   # Increased from 45.0
+        
         # Calculate heading differences and change rates
         heading_diffs = []
         change_rates = []
@@ -603,7 +660,8 @@ class CompassCalibrator:
                         data[i]['heading_change_rate'] = rate
         
         if not heading_diffs:
-            return []
+            print("Warning: No heading differences found, returning all data without outlier removal")
+            return data
             
         # Calculate statistics for outlier detection
         mean_diff = np.mean(heading_diffs)
@@ -616,16 +674,21 @@ class CompassCalibrator:
             # Check heading difference outlier
             is_diff_outlier = False
             if 'heading_diff' in entry:
-                is_diff_outlier = abs(entry['heading_diff']) > mean_diff + self.outlier_threshold * std_diff
+                is_diff_outlier = abs(entry['heading_diff']) > mean_diff + local_outlier_threshold * std_diff
             
             # Check heading change rate outlier
             is_rate_outlier = False
             if 'heading_change_rate' in entry:
-                is_rate_outlier = entry['heading_change_rate'] > self.max_heading_change_rate
+                is_rate_outlier = entry['heading_change_rate'] > local_max_change_rate
             
             # Include only non-outliers
             if not is_diff_outlier and not is_rate_outlier:
                 cleaned_data.append(entry)
+        
+        # Always return at least some data
+        if len(cleaned_data) < 5 and len(data) > 0:
+            print(f"Warning: Too few data points after outlier removal ({len(cleaned_data)} < 5), using all data")
+            return data
         
         return cleaned_data
     
