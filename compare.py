@@ -522,16 +522,29 @@ def visualize_headings(gps_data, heading_data, output_path, title="Compass Headi
         metrics: Optional metrics to display
         max_arrows: Maximum number of arrows to display
     """
-    # Create a map of timestamps to GPS positions
-    gps_map = {entry['timestamp']: (entry['latitude'], entry['longitude']) 
-             for entry in gps_data}
+    # Create a list of GPS timestamps for efficient lookup
+    gps_timestamps = [entry['timestamp'] for entry in gps_data]
     
-    # Match headings with GPS positions
+    # Match headings with GPS positions using closest timestamp within threshold
+    threshold = 0.8  # seconds
     matched_data = []
+    
     for entry in heading_data:
         ts = entry['timestamp']
-        if ts in gps_map:
-            lat, lon = gps_map[ts]
+        # Find closest GPS timestamp
+        closest_idx = None
+        min_diff = float('inf')
+        
+        for i, gps_ts in enumerate(gps_timestamps):
+            diff = abs(ts - gps_ts)
+            if diff < min_diff:
+                min_diff = diff
+                closest_idx = i
+        
+        # Only use if within threshold
+        if closest_idx is not None and min_diff < threshold:
+            gps_entry = gps_data[closest_idx]
+            lat, lon = gps_entry['latitude'], gps_entry['longitude']
             heading = entry['heading']
             matched_data.append((ts, lat, lon, heading))
     

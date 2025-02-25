@@ -20,7 +20,7 @@ class CompassCalibrator:
     - Kalman filtering with sensor fusion for smoothed outputs
     """
     
-    def __init__(self, min_speed_threshold=0.1, max_heading_change_rate=45.0, 
+    def __init__(self, min_speed_threshold=0.5, max_heading_change_rate=45.0, 
                  outlier_threshold=3.0, time_alignment_threshold=0.5,
                  use_kalman_filter=True, wheel_diameter=130, wheel_base=200,
                  use_ellipsoid_fit=True):
@@ -494,6 +494,73 @@ class CompassCalibrator:
             curr_entry['speed'] = speed
         
         return aligned_data
+    # def _calculate_gps_headings(self, aligned_data):
+    #     """
+    #     Calculate headings from GPS data using easting/northing coordinates
+        
+    #     Returns:
+    #         Data with GPS headings and speeds added
+    #     """
+    #     # Define minimum distance threshold to filter noise
+    #     min_distance_threshold = 0.1  # meters
+        
+    #     # Set up a projection if not already done
+    #     if not hasattr(self, 'proj') or self.proj is None:
+    #         # Get reference point from first valid GPS entry
+    #         for entry in aligned_data:
+    #             if 'latitude' in entry and 'longitude' in entry and entry['latitude'] is not None:
+    #                 ref_lat = entry['latitude']
+    #                 ref_lon = entry['longitude']
+                    
+    #                 # Set up a transverse Mercator projection centered on the reference point
+    #                 import pyproj
+    #                 proj_string = f"+proj=tmerc +lat_0={ref_lat} +lon_0={ref_lon} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs"
+    #                 self.proj = pyproj.Proj(proj_string)
+    #                 break
+        
+    #     # Calculate headings
+    #     for i in range(1, len(aligned_data)):
+    #         prev_entry = aligned_data[i-1]
+    #         curr_entry = aligned_data[i]
+            
+    #         # Skip if GPS data is missing
+    #         if ('latitude' not in prev_entry or 'longitude' not in prev_entry or
+    #             'latitude' not in curr_entry or 'longitude' not in curr_entry or
+    #             prev_entry['latitude'] is None or prev_entry['longitude'] is None or
+    #             curr_entry['latitude'] is None or curr_entry['longitude'] is None):
+    #             continue
+            
+    #         # Calculate time difference
+    #         time_diff = curr_entry['timestamp'] - prev_entry['timestamp']
+    #         if time_diff <= 0:
+    #             continue
+                
+    #         # Convert to easting/northing
+    #         east1, north1 = self.proj(prev_entry['longitude'], prev_entry['latitude'])
+    #         east2, north2 = self.proj(curr_entry['longitude'], curr_entry['latitude'])
+            
+    #         # Calculate distance in the projected coordinate system
+    #         delta_east = east2 - east1
+    #         delta_north = north2 - north1
+    #         distance = math.sqrt(delta_east**2 + delta_north**2)
+            
+    #         # Skip if distance is too small (noise)
+    #         if distance < min_distance_threshold:
+    #             continue
+            
+    #         # Calculate heading using Cartesian coordinates
+    #         # atan2(delta_east, delta_north) gives heading where 0° is North and 90° is East
+    #         heading = math.degrees(math.atan2(delta_east, delta_north))
+    #         heading = (heading + 360) % 360
+            
+    #         # Calculate speed
+    #         speed = distance / time_diff
+            
+    #         # Store heading and speed
+    #         curr_entry['gps_heading'] = heading
+    #         curr_entry['speed'] = speed
+        
+    #     return aligned_data
     
     def _calculate_rpm_angular_velocity(self, aligned_data):
         """
@@ -609,7 +676,7 @@ class CompassCalibrator:
         """
         for entry in data:
             north = -entry['mag_z']
-            east = -entry['mag_y']
+            east = entry['mag_y']
             
             # Calculate heading (clockwise from North)
             heading = math.degrees(math.atan2(east, north))
@@ -693,28 +760,24 @@ class CompassCalibrator:
         return cleaned_data
     
     def _perform_gps_calibration(self, data):
-        """
-        Perform final calibration using GPS headings as reference
-        
-        Returns:
-            Calibration parameters
-        """
         # Extract data for calibration
         mag_headings = np.array([entry['mag_heading'] for entry in data])
         gps_headings = np.array([entry['gps_heading'] for entry in data])
         
-        # Initial parameters [scale, offset]
-        initial_params = [1.0, 0.0]
+        # More complex model with sinusoidal components to better model 
+        # directional distortions (similar to soft iron effects)
+        initial_params = [1.0, 0.0, 0.0, 0.0]  # [scale, offset, sin_amp, cos_amp]
         
         def residuals(params):
-            scale, offset = params
+            scale, offset, sin_amp, cos_amp = params
             
-            # Apply calibration
-            calibrated_headings = (scale * mag_headings + offset) % 360
+            # Apply calibration with sinusoidal terms
+            angle_rad = np.radians(mag_headings)
+            correction = sin_amp * np.sin(angle_rad) + cos_amp * np.cos(angle_rad)
+            calibrated_headings = (scale * mag_headings + offset + correction) % 360
             
-            # Calculate smallest angle differences
+            # Calculate errors
             errors = np.array([((c - g + 180) % 360 - 180) for c, g in zip(calibrated_headings, gps_headings)])
-            
             return errors
         
         # Perform optimization
@@ -723,6 +786,8 @@ class CompassCalibrator:
             return {
                 'scale': float(result.x[0]),
                 'offset': float(result.x[1]),
+                'sin_amp': float(result.x[2]),
+                'cos_amp': float(result.x[3]),
                 'method': 'gps'
             }
         except Exception as e:
@@ -731,6 +796,8 @@ class CompassCalibrator:
             return {
                 'scale': 1.0,
                 'offset': 0.0,
+                'sin_amp': 0.0,
+                'cos_amp': 0.0,
                 'method': 'default'
             }
     
@@ -788,7 +855,7 @@ class CompassCalibrator:
                 
                 # Convert to NED frame
                 north = -calibrated_v[2]  # North = -Z
-                east = -calibrated_v[1]   # East = -Y
+                east = calibrated_v[1]   # East = -Y
             else:
                 # Convert directly to NED frame
                 north = -entry['mag_z']
@@ -802,7 +869,13 @@ class CompassCalibrator:
             if 'gps' in self.calibration_params:
                 scale = self.calibration_params['gps']['scale']
                 offset = self.calibration_params['gps']['offset']
-                heading = (scale * heading + offset) % 360
+                sin_amp = self.calibration_params['gps']['sin_amp']
+                cos_amp = self.calibration_params['gps']['cos_amp']
+                
+                # Apply sinusoidal correction
+                angle_rad = np.radians(heading)
+                correction = sin_amp * np.sin(angle_rad) + cos_amp * np.cos(angle_rad)
+                heading = (scale * heading + offset + correction) % 360
             
             calibrated_headings.append({
                 'timestamp': entry['timestamp'],
@@ -880,7 +953,7 @@ class CompassCalibrator:
             # Process noise increases with time
             kf.Q = np.array([
                 [0.1*dt, 0.05*dt],
-                [0.05*dt, 0.1*dt]
+                [0.05*dt, 0.1*dtheading]
             ])
             
             # Predict
