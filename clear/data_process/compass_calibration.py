@@ -261,6 +261,8 @@ class CompassCalibrator:
         self.wheel_diameter = wheel_diameter / 1000.0  # mm to m
         self.wheel_base = wheel_base / 1000.0  # mm to m
         self.wheel_radius = self.wheel_diameter / 2.0
+        self._kf_use_gps = False
+        self._kf_use_rpm = False
         
         # Calibration parameters
         self.ellipsoid_params = None  # From ellipsoid fitting
@@ -288,8 +290,17 @@ class CompassCalibrator:
         if self.use_static_calibration:
             self.static_cal_params = self._perform_static_calibration(mag_data)
         
+        # apply ellipsoid calibration to mag_data
+        if self.ellipsoid_params and self.use_ellipsoid_fit:
+            mag_data_calibrated = self._apply_ellipsoid_calibration(mag_data)
+            # disable ellipsoid fit to avoid double calibration
+            self.use_ellipsoid_fit = False
+        
+        else:
+            mag_data_calibrated = mag_data
+        
         # Step 2: Preprocess and align data
-        aligned_data = self._align_timestamps(gps_data, mag_data, rpm_data)
+        aligned_data = self._align_timestamps(gps_data, mag_data_calibrated, rpm_data)
         
         # Step 3: Calculate GPS headings and speeds
         aligned_data = self._calculate_gps_headings(aligned_data)
@@ -985,7 +996,7 @@ class CompassCalibrator:
             v_right = (rpm_right / 60) * 2 * math.pi * self.wheel_radius
             
             # Calculate angular velocity (rad/s)
-            angular_velocity = (v_right - v_left) / self.wheel_base
+            angular_velocity =  (v_right - v_left) / self.wheel_base
             
             # Convert to deg/s
             angular_velocity_deg = math.degrees(angular_velocity)
@@ -1386,7 +1397,11 @@ class CompassCalibrator:
         # State vector: [heading, heading_rate]
         n_states = 2
         # Measurement vector: [mag_heading, gps_heading (optional), rpm_heading (optional)]
-        n_measurements = 3  # Maximum number of measurements
+        n_measurements = 1  # Maximum number of measurements
+        if self._kf_use_gps:
+            n_measurements += 1
+        if self._kf_use_rpm:
+            n_measurements += 1
         
         # Initialize Kalman filter
         kf = KalmanFilter(dim_x=n_states, dim_z=n_measurements)
@@ -1404,7 +1419,7 @@ class CompassCalibrator:
         
         # Measurement noise (uncertainties in each sensor)
         # Order: [mag_heading, gps_heading (optional), rpm_heading (optional)]
-        kf.R = np.diag([10, 5, 20])  # GPS more reliable than magnetometer, RPM less reliable
+        kf.R = np.diag([5, 10, 20])  # GPS more reliable than magnetometer, RPM less reliable
         
         smoothed_headings = []
         prev_ts = first_ts
@@ -1434,8 +1449,8 @@ class CompassCalibrator:
             
             # Process noise increases with time
             kf.Q = np.array([
-                [0.1*dt, 0.05*dt],
-                [0.05*dt, 0.1*dt]
+                [0.05*dt, 0.02*dt],
+                [0.02*dt, 0.05*dt]
             ])
             
             # Predict
@@ -1458,7 +1473,8 @@ class CompassCalibrator:
             
             # 2. GPS heading (if available and reliable)
             if ('gps_heading' in entry and 
-                entry.get('speed', 0) >= self.min_speed_threshold):
+                entry.get('speed', 0) >= self.min_speed_threshold and
+                self._kf_use_gps):
                 gps_heading = entry['gps_heading']
                 # Handle heading wraparound
                 predicted_heading = kf.x[0, 0] % 360
@@ -1469,7 +1485,7 @@ class CompassCalibrator:
                 H_rows.append([1, 0])  # Measurement maps to heading state
             
             # 3. RPM heading (if available)
-            if 'rpm_heading' in entry:
+            if 'rpm_heading' in entry and self._kf_use_rpm:
                 rpm_heading = entry['rpm_heading']
                 # Handle heading wraparound
                 predicted_heading = kf.x[0, 0] % 360
@@ -1480,7 +1496,7 @@ class CompassCalibrator:
                 H_rows.append([1, 0])  # Measurement maps to heading state
             
             # 4. RPM angular velocity (if available)
-            if 'rpm_angular_velocity' in entry:
+            if 'rpm_angular_velocity' in entry and self._kf_use_rpm:
                 rpm_angular_vel = entry['rpm_angular_velocity']
                 measurements.append(rpm_angular_vel)
                 H_rows.append([0, 1])  # Measurement maps to heading rate state
@@ -1493,23 +1509,25 @@ class CompassCalibrator:
                 # Create a zero matrix with the expected shape
                 H = np.zeros((n_measurements, n_states))
                 # High uncertainty for padding values
-                R = np.eye(n_measurements) * 1000  
+                R = np.eye(n_measurements) * 15
                 
                 # Fill in available measurements (up to the expected number)
                 for j in range(min(len(measurements), n_measurements)):
                     z[j, 0] = measurements[j]
                     H[j] = H_rows[j]
                     
+                    
                     # Set appropriate uncertainty based on measurement type
                     if H_rows[j][0] == 1:  # Heading measurement
                         if j == 0:  # Magnetometer
                             R[j, j] = 10
-                        elif j == 1:  # GPS
-                            R[j, j] = 10
-                        elif j == 2:  # RPM
+                        elif j == 1 and self._kf_use_gps:  # GPS
+                            gps_noise = 20.0 / max(1.0, entry.get('speed', 0))  # More reliable at higher speeds
+                            R[j, j] = gps_noise
+                        elif j == 2 and self._kf_use_rpm:  # RPM
                             R[j, j] = 20
                     elif H_rows[j][1] == 1:  # Angular velocity measurement
-                        R[j, j] = 20
+                        R[j, j] = 30
                 
                 # Update Kalman filter parameters
                 kf.H = H
