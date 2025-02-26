@@ -3,6 +3,211 @@ import math
 from scipy.optimize import least_squares
 from scipy.linalg import eigh
 from filterpy.kalman import KalmanFilter
+import matplotlib.pyplot as plt
+import utm
+
+USE_NED = True
+def visualize_headings(
+    gps_data, 
+    heading_data, 
+    heading_data_key_name="heading",
+    output_path=None,
+    title="Compass Headings", 
+    metrics=None, 
+    max_arrows=150
+    ):
+    """
+    Visualize compass headings as arrows at GPS locations
+    
+    Args:
+        gps_data: List of dictionaries with GPS data
+        heading_data: List of dictionaries with heading data
+        heading_data_key_name: Key name for heading in heading_data dictionaries
+        output_path: Path to save the output image
+        title: Title for the plot
+        metrics: Optional metrics to display
+        max_arrows: Maximum number of arrows to display
+    """
+    
+    # Convert data to numpy arrays for vectorized operations
+    gps_timestamps = np.array([entry['timestamp'] for entry in gps_data])
+    gps_lats = np.array([entry['latitude'] for entry in gps_data])
+    gps_lons = np.array([entry['longitude'] for entry in gps_data])
+    
+    valid_heading_data = [entry for entry in heading_data if heading_data_key_name in entry]
+    if len(valid_heading_data) == 0:
+        print(f"Warning: No matching data points found for {title}")
+        return
+    
+    heading_timestamps = np.array([entry['timestamp'] for entry in valid_heading_data])
+    heading_values = np.array([entry[heading_data_key_name] for entry in valid_heading_data])
+    
+    # Fully vectorized matching approach
+    threshold = 0.8  # seconds
+    
+    # Create a 2D array of time differences between each heading timestamp and all GPS timestamps
+    # shape: (n_headings, n_gps)
+    time_diff_matrix = np.abs(heading_timestamps[:, np.newaxis] - gps_timestamps[np.newaxis, :])
+    
+    # Find the index of the closest GPS point for each heading
+    closest_indices = np.argmin(time_diff_matrix, axis=1)
+    
+    # Get the minimum time difference for each heading
+    min_diffs = np.min(time_diff_matrix, axis=1)
+
+    # Create a mask for headings that have a GPS point within the threshold
+    valid_mask = min_diffs < threshold
+    
+    # Extract timestamps, positions, and headings for valid matches
+    valid_timestamps = heading_timestamps[valid_mask]
+    valid_lats = gps_lats[closest_indices[valid_mask]]
+    valid_lons = gps_lons[closest_indices[valid_mask]]
+    valid_headings = heading_values[valid_mask]
+    
+    # Create a sorted index based on timestamps
+    sorted_indices = np.argsort(valid_timestamps)
+    
+    # Sort all arrays using the timestamp order
+    valid_timestamps = valid_timestamps[sorted_indices]
+    valid_lats = valid_lats[sorted_indices]
+    valid_lons = valid_lons[sorted_indices]
+    valid_headings = valid_headings[sorted_indices]
+    
+    if len(valid_timestamps) == 0:
+        print(f"Warning: No matching data points found for {title}")
+        # Create a blank image with error message
+        plt.figure(figsize=(12, 10))
+        plt.text(0.5, 0.5, f"No matching data points found for {title}", 
+                ha='center', va='center', fontsize=16)
+        plt.axis('off')
+        if output_path:
+            plt.savefig(output_path, dpi=300)
+        plt.close()
+        return
+    
+    # Sparsify if too many points (vectorized)
+    if len(valid_lats) > max_arrows:
+        step = len(valid_lats) // max_arrows
+        indices = np.arange(0, len(valid_lats), step)
+        valid_lats = valid_lats[indices]
+        valid_lons = valid_lons[indices]
+        valid_headings = valid_headings[indices]
+    
+    # Convert heading to direction components (vectorized)
+    # u = east component, v = north component
+    headings_rad = np.radians(valid_headings)
+    u = np.sin(headings_rad)
+    v = np.cos(headings_rad)
+    
+    # Create plot
+    plt.figure(figsize=(12, 10))
+    
+    # Plot GPS track
+    all_lats = [entry['latitude'] for entry in gps_data]
+    all_lons = [entry['longitude'] for entry in gps_data]
+    # plt.plot(all_lons, all_lats, 'b-', alpha=0.3, linewidth=1.5, label='GPS Track')
+
+    # plot as a scatter plot
+    plt.scatter(all_lons, all_lats, color='blue', s=1, label='GPS Track')
+    
+    # Plot heading arrows
+    plt.quiver(valid_lons, valid_lats, u, v, color='red', scale=25, width=0.003, 
+              alpha=0.8, label='Heading', pivot='mid')
+    
+    # Mark start and end points
+    plt.scatter(all_lons[0], all_lats[0], color='green', s=100, label='Start')
+    plt.scatter(all_lons[-1], all_lats[-1], color='red', s=100, label='End')
+    
+    # Build title with metrics if provided
+    if metrics:
+        # Handle potentially NaN or missing metrics
+        mean_error = metrics.get('mean_error', float('nan'))
+        median_error = metrics.get('median_error', float('nan'))
+        max_error = metrics.get('max_error', float('nan'))
+        
+        # Format as strings with error handling
+        mean_str = f"{mean_error:.2f}°" if not math.isnan(mean_error) else "N/A"
+        median_str = f"{median_error:.2f}°" if not math.isnan(median_error) else "N/A"
+        max_str = f"{max_error:.2f}°" if not math.isnan(max_error) else "N/A"
+        
+        metrics_text = f"\nMean Error: {mean_str}, Median: {median_str}, Max: {max_str}"
+        title = title + metrics_text
+    
+    plt.title(title)
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    
+    # Save figure if output path is provided
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+    else:
+        # Show the plot if no output path is provided
+        plt.show(block=True)
+        
+    plt.close()
+    
+def visualize_gps_track(data,output_path=None,title="gps track"):
+    """
+    Visualize GPS track data
+    """
+    valid_data = [entry for entry in data \
+        if 'latitude' in entry and 'longitude' in entry\
+            and entry['latitude'] is not None and entry['longitude'] is not None]
+    if len(valid_data) == 0:
+        print(f"Warning: No matching data points found for {title}")
+        return
+    
+    lats = np.array([entry['latitude'] for entry in valid_data])
+    lons = np.array([entry['longitude'] for entry in valid_data])
+    
+    plt.figure(figsize=(12, 10))
+    plt.scatter(lons, lats, color='blue', s=1, label='GPS Track')
+    plt.title(title)
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+    else:
+        plt.show(block=True)
+    
+    plt.close()
+    
+    
+    
+def visualize_speed(data,key="speed",output_path=None,title="Speed",metrics=None):
+    """
+    Visualize speed data
+    """
+    valid_data = [entry for entry in data if key in entry]
+    if len(valid_data) == 0:
+        print(f"Warning: No matching data points found for {title}")
+        return
+    
+    timestamps = np.array([entry['timestamp'] for entry in valid_data])
+    values = np.array([entry[key] for entry in valid_data])
+    plt.figure(figsize=(12, 10))
+    plt.plot(timestamps, values, 'b-', alpha=0.3, linewidth=1.5, label='Speed')
+    plt.title(title)
+    plt.xlabel('Timestamp')
+    plt.ylabel('Speed (m/s)')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+    else:
+        plt.show(block=True)
+    
+    plt.close()
+    
 
 class CompassCalibrator:
     """
@@ -23,7 +228,8 @@ class CompassCalibrator:
     def __init__(self, min_speed_threshold=0.5, max_heading_change_rate=45.0, 
                  outlier_threshold=3.0, time_alignment_threshold=0.5,
                  use_kalman_filter=True, wheel_diameter=130, wheel_base=200,
-                 use_ellipsoid_fit=True):
+                 use_ellipsoid_fit=True, use_gps_calibration=False,
+                 use_static_calibration=False, outlier_percentage=0.02):
         """
         Initialize the compass calibrator
         
@@ -35,6 +241,10 @@ class CompassCalibrator:
             use_kalman_filter: Whether to apply Kalman filtering for smoothing
             wheel_diameter: Diameter of the wheels in mm
             wheel_base: Distance between left and right wheels in mm
+            use_ellipsoid_fit: Whether to use ellipsoid fitting for calibration
+            use_gps_calibration: Whether to use GPS data for calibration
+            use_static_calibration: Whether to use simple min/max calibration method
+            outlier_percentage: Percentage of data to consider as outliers (0.02 = 2%)
         """
         self.min_speed_threshold = min_speed_threshold
         self.max_heading_change_rate = max_heading_change_rate
@@ -42,7 +252,9 @@ class CompassCalibrator:
         self.time_alignment_threshold = time_alignment_threshold
         self.use_kalman_filter = use_kalman_filter
         self.use_ellipsoid_fit = use_ellipsoid_fit
-        
+        self.use_gps_calibration = use_gps_calibration
+        self.use_static_calibration = use_static_calibration
+        self.outlier_percentage = outlier_percentage
         # Wheel parameters for RPM calculations (convert to meters)
         self.wheel_diameter = wheel_diameter / 1000.0  # mm to m
         self.wheel_base = wheel_base / 1000.0  # mm to m
@@ -51,6 +263,7 @@ class CompassCalibrator:
         # Calibration parameters
         self.ellipsoid_params = None  # From ellipsoid fitting
         self.gps_cal_params = None    # From GPS ground truth
+        self.static_cal_params = None  # From static min/max calibration
         self.validation_metrics = None
     
     def calibrate(self, gps_data, mag_data, rpm_data=None):
@@ -66,16 +279,15 @@ class CompassCalibrator:
             List of dictionaries with keys 'timestamp' and 'heading' (in degrees, NED frame)
         """
         # Step 1: Perform ellipsoid fitting on magnetometer data
-        self.ellipsoid_params = self._perform_ellipsoid_fitting(mag_data)
-        
         if self.use_ellipsoid_fit:
-            # Apply initial ellipsoid calibration to magnetometer data
-            mag_data_calibrated = self._apply_ellipsoid_calibration(mag_data)
-        else:
-            mag_data_calibrated = mag_data
+            self.ellipsoid_params = self._perform_ellipsoid_fitting(mag_data, gps_data)
+        
+        # Step 1b: Perform static calibration if enabled
+        if self.use_static_calibration:
+            self.static_cal_params = self._perform_static_calibration(mag_data)
         
         # Step 2: Preprocess and align data
-        aligned_data = self._align_timestamps(gps_data, mag_data_calibrated, rpm_data)
+        aligned_data = self._align_timestamps(gps_data, mag_data, rpm_data)
         
         # Step 3: Calculate GPS headings and speeds
         aligned_data = self._calculate_gps_headings(aligned_data)
@@ -150,7 +362,191 @@ class CompassCalibrator:
         
         return T, radii
 
-    def _perform_ellipsoid_fitting(self, mag_data):
+    def _perform_ellipsoid_fitting(self, mag_data, gps_data=None):
+        """
+        Perform ellipsoid fitting to calibrate magnetometer data
+        
+        Args:
+            mag_data: List of magnetometer readings with keys 'x', 'y', 'z', 'timestamp'
+            gps_data: Optional list of GPS readings with keys 'latitude', 'longitude', 'timestamp'
+                
+        Returns:
+            Dictionary with calibration parameters
+        """
+        try:
+            # Extract magnetic field readings
+            x = np.array([entry['x'] for entry in mag_data])
+            y = np.array([entry['y'] for entry in mag_data])
+            z = np.array([entry['z'] for entry in mag_data])
+            
+            # Determine the expected field strength (F)
+            F = self._get_field_strength(gps_data)
+            
+            # Prepare data for ellipsoid fit - format as [3,N] array
+            s = np.vstack([x, y, z])
+            
+            # Perform ellipsoid fit
+            M, n, d = self._ellipsoid_fit(s)
+            
+            # Calculate calibration parameters
+            try:
+                # Get the inverse of M
+                M_1 = np.linalg.inv(M)
+                
+                # Calculate the offset (hard iron bias)
+                offset = -np.dot(M_1, n)
+                
+                # Calculate the transformation matrix (soft iron correction)
+                # Note: F is already in raw LSB units matching the sensor data
+                transform = np.real(F / np.sqrt(np.dot(n.T, np.dot(M_1, n)) - d) * np.linalg.sqrtm(M))
+                
+                return {
+                    'offset_x': float(offset[0]),
+                    'offset_y': float(offset[1]),
+                    'offset_z': float(offset[2]),
+                    'transform': transform.tolist(),
+                    'method': 'ellipsoid',
+                    'field_strength': float(F)
+                }
+            except np.linalg.LinAlgError as e:
+                print(f"Matrix inversion error: {e}")
+                return {
+                    'offset_x': 0.0,
+                    'offset_y': 0.0,
+                    'offset_z': 0.0,
+                    'transform': np.eye(3).tolist(),
+                    'method': 'identity',
+                    'field_strength': float(F)
+                }
+                
+        except Exception as e:
+            print(f"Ellipsoid fitting failed: {e}")
+            return {
+                'offset_x': 0.0,
+                'offset_y': 0.0,
+                'offset_z': 0.0,
+                'transform': np.eye(3).tolist(),
+                'method': 'identity',
+                'field_strength': 1000.0  # Default field strength
+            }
+
+    def _get_field_strength(self, gps_data, gain=1090):
+        """
+        Get the expected magnetic field strength in raw LSB units
+        
+        Args:
+            gps_data: List of GPS data entries with latitude and longitude
+            gain: Sensor gain in LSB/Gauss (default: 1090 for HMC5883L at ±1.3Ga)
+            
+        Returns:
+            Field strength in raw LSB units
+        """
+        # Default field strength if we can't calculate it
+        default_F = 1000.0
+        
+        # If no GPS data is provided, use default
+        if not gps_data:
+            print("No GPS data provided. Using default field strength.")
+            return default_F
+        
+        try:
+            # Find the first valid GPS reading
+            valid_gps = next((entry for entry in gps_data 
+                            if 'latitude' in entry and 'longitude' in entry 
+                            and entry['latitude'] is not None 
+                            and entry['longitude'] is not None), None)
+            
+            if not valid_gps:
+                print("No valid GPS coordinates found. Using default field strength.")
+                return default_F
+            
+            # Extract coordinates
+            latitude = valid_gps['latitude']
+            longitude = valid_gps['longitude']
+            altitude = valid_gps.get('altitude', 0)
+            
+            # Use geomag to get the field strength
+            try:
+                import geomag
+                geo_mag = geomag.GeoMag()
+                result = geo_mag.GeoMag(latitude, longitude, altitude)
+                total_field_nT = result.total
+                
+                # Convert nT to Gauss
+                total_field_gauss = total_field_nT * 1e-5
+                
+                # Convert Gauss to raw LSB value using gain
+                raw_field = total_field_gauss * gain
+                
+                print(f"Magnetic field at ({latitude}, {longitude}): {total_field_nT} nT")
+                print(f"Converted to raw LSB value: {raw_field:.2f}")
+                
+                return raw_field
+            except ImportError:
+                print("geomag library not found. Using default field strength.")
+                return default_F
+        except Exception as e:
+            print(f"Error calculating field strength: {e}")
+            return default_F
+
+    def _ellipsoid_fit(self, s):
+        """
+        Estimate ellipsoid parameters from a set of points.
+        
+        Parameters
+        ----------
+        s : array_like
+        The samples (M,N) where M=3 (x,y,z) and N=number of samples.
+        
+        Returns
+        -------
+        M, n, d : array_like, array_like, float
+        The ellipsoid parameters M, n, d.
+        """
+        # D (samples)
+        D = np.array([s[0]**2., s[1]**2., s[2]**2.,
+                    2.*s[1]*s[2], 2.*s[0]*s[2], 2.*s[0]*s[1],
+                    2.*s[0], 2.*s[1], 2.*s[2], np.ones_like(s[0])])
+
+        # S, S_11, S_12, S_21, S_22 (eq. 11)
+        S = np.dot(D, D.T)
+        S_11 = S[:6,:6]
+        S_12 = S[:6,6:]
+        S_21 = S[6:,:6]
+        S_22 = S[6:,6:]
+
+        # C (Eq. 8, k=4)
+        C = np.array([[-1,  1,  1,  0,  0,  0],
+                    [ 1, -1,  1,  0,  0,  0],
+                    [ 1,  1, -1,  0,  0,  0],
+                    [ 0,  0,  0, -4,  0,  0],
+                    [ 0,  0,  0,  0, -4,  0],
+                    [ 0,  0,  0,  0,  0, -4]])
+
+        # v_1 (eq. 15, solution)
+        E = np.dot(np.linalg.inv(C),
+                S_11 - np.dot(S_12, np.dot(np.linalg.inv(S_22), S_21)))
+
+        E_w, E_v = np.linalg.eig(E)
+
+        v_1 = E_v[:, np.argmax(E_w)]
+        if v_1[0] < 0: v_1 = -v_1
+
+        # v_2 (eq. 13, solution)
+        v_2 = np.dot(np.dot(-np.linalg.inv(S_22), S_21), v_1)
+
+        # quadratic-form parameters, parameters h and f swapped as per correction 
+        M = np.array([[v_1[0], v_1[5], v_1[4]],
+                    [v_1[5], v_1[1], v_1[3]],
+                    [v_1[4], v_1[3], v_1[2]]])
+        n = np.array([[v_2[0]],
+                    [v_2[1]],
+                    [v_2[2]]])
+        d = v_2[3]
+
+        return M, n, d
+
+    def _perform_ellipsoid_fitting_v0(self, mag_data):
         """
         Perform ellipsoid fitting to calibrate magnetometer data
         
@@ -222,31 +618,6 @@ class CompassCalibrator:
                 'transform': np.eye(3).tolist(),
                 'method': 'identity'
             }
-    
-    def _get_ellipsoid_params(self, A, offset):
-        """
-        Extract ellipsoid parameters from matrix form
-        
-        Args:
-            A: 3x3 quadratic form matrix
-            offset: center of ellipsoid
-            
-        Returns:
-            T: transformation matrix, radii: squared radii of ellipsoid
-        """
-        # Calculate the matrix containing offset
-        C = np.eye(3)
-        
-        # Get eigenvalues and eigenvectors
-        eigvals, eigvecs = eigh(A)
-        
-        # Radii are inversely proportional to the square root of eigenvalues
-        radii = 1.0 / eigvals
-        
-        # Transform matrix from ellipsoid to sphere
-        T = eigvecs
-        
-        return T, radii
     
     def _apply_ellipsoid_calibration(self, mag_data):
         """
@@ -447,6 +818,15 @@ class CompassCalibrator:
         """
         # Define minimum distance threshold to filter noise
         min_distance_threshold = 0.1  # meters
+
+        if USE_NED:
+            # Convert all GPS data to UTM coordinates
+            for entry in aligned_data:
+                if 'latitude' in entry and 'longitude' in entry\
+                    and entry['latitude'] is not None and entry['longitude'] is not None:
+                    east, north, _, _ = utm.from_latlon(entry['latitude'], entry['longitude'])
+                    entry['longitude'] = east
+                    entry['latitude'] = north
         
         for i in range(1, len(aligned_data)):
             prev_entry = aligned_data[i-1]
@@ -464,27 +844,46 @@ class CompassCalibrator:
             if time_diff <= 0:
                 continue
                 
-            # Convert to radians
-            lat1, lon1 = math.radians(prev_entry['latitude']), math.radians(prev_entry['longitude'])
-            lat2, lon2 = math.radians(curr_entry['latitude']), math.radians(curr_entry['longitude'])
-            
-            # Calculate distance using haversine formula
-            a = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-            distance = 6371000 * c  # Earth radius in meters
-            
-            # Skip if distance is too small (noise)
-            if distance < min_distance_threshold:
-                continue
-            
-            # Calculate heading
-            y = math.sin(lon2 - lon1) * math.cos(lat2)
-            x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(lon2 - lon1)
-            heading = math.atan2(y, x)
-            
-            # Convert to degrees and normalize to 0-360
-            heading = math.degrees(heading)
-            heading = (heading + 360) % 360
+            if USE_NED:
+                # Convert to UTM coordinates
+                prev_e, prev_n = prev_entry['longitude'], prev_entry['latitude']
+                curr_e, curr_n = curr_entry['longitude'], curr_entry['latitude']
+                
+                # Calculate distance in meters
+                distance = math.sqrt((curr_e - prev_e) ** 2 + (curr_n - prev_n) ** 2)
+
+                # Skip if distance is too small (noise)
+                if distance < 0.2:
+                    continue
+                
+                # Calculate heading
+                # TODO: what is the correct way to do this?
+                heading = math.atan2(curr_e - prev_e, curr_n - prev_n)
+                heading = math.degrees(heading)
+                heading = (heading + 360) % 360
+
+            else:
+                # Convert to radians
+                lat1, lon1 = math.radians(prev_entry['latitude']), math.radians(prev_entry['longitude'])
+                lat2, lon2 = math.radians(curr_entry['latitude']), math.radians(curr_entry['longitude'])
+                
+                # Calculate distance using haversine formula
+                a = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                distance = 6371000 * c  # Earth radius in meters
+                
+                # Skip if distance is too small (noise)
+                if distance < min_distance_threshold:
+                    continue
+                
+                # Calculate heading
+                y = math.sin(lon2 - lon1) * math.cos(lat2)
+                x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(lon2 - lon1)
+                heading = math.atan2(y, x)
+                
+                # Convert to degrees and normalize to 0-360
+                heading = math.degrees(heading)
+                heading = (heading + 360) % 360
             
             # Calculate speed
             speed = distance / time_diff
@@ -675,6 +1074,7 @@ class CompassCalibrator:
             Data with magnetometer headings added
         """
         for entry in data:
+            # TODO: what is the correct way to do this?
             north = -entry['mag_z']
             east = entry['mag_y']
             
@@ -801,27 +1201,80 @@ class CompassCalibrator:
                 'method': 'default'
             }
     
+    def _perform_static_calibration(self, mag_data):
+        """
+        Perform simple static calibration based on min/max values with outlier removal
+        
+        Args:
+            mag_data: List of dictionaries with keys 'x', 'y', 'z', 'timestamp'
+            
+        Returns:
+            Dictionary with offset and scale values
+        """
+        # Extract x, y, z values
+        x_values = [entry['x'] for entry in mag_data]
+        y_values = [entry['y'] for entry in mag_data]
+        z_values = [entry['z'] for entry in mag_data]
+        
+        # Remove outliers if specified
+        if self.outlier_percentage > 0:
+            for values in [x_values, y_values, z_values]:
+                values.sort()
+                outlier_count = int(len(values) * self.outlier_percentage / 2)
+                # Remove top and bottom outliers
+                if outlier_count > 0:
+                    values = values[outlier_count:-outlier_count]
+        
+        # Calculate offsets (hard iron correction)
+        offset_x = (max(x_values) + min(x_values)) / 2
+        offset_y = (max(y_values) + min(y_values)) / 2
+        offset_z = (max(z_values) + min(z_values)) / 2
+        
+        # Calculate scales (soft iron correction)
+        x_range = max(x_values) - min(x_values)
+        y_range = max(y_values) - min(y_values)
+        z_range = max(z_values) - min(z_values)
+        
+        # Calculate average range to normalize to
+        avg_range = (x_range + y_range + z_range) / 3
+        
+        # Calculate scale factors (avoid division by zero)
+        scale_x = avg_range / max(x_range, 0.001)
+        scale_y = avg_range / max(y_range, 0.001)
+        scale_z = avg_range / max(z_range, 0.001)
+        
+        print(f"Static calibration: offsets ({offset_x:.2f}, {offset_y:.2f}, {offset_z:.2f})")
+        print(f"Static calibration: scales ({scale_x:.2f}, {scale_y:.2f}, {scale_z:.2f})")
+        
+        return {
+            'offset_x': float(offset_x),
+            'offset_y': float(offset_y),
+            'offset_z': float(offset_z),
+            'scale_x': float(scale_x),
+            'scale_y': float(scale_y),
+            'scale_z': float(scale_z),
+            'method': 'static'
+        }
+    
     def _combine_calibration_params(self):
         """
-        Combine ellipsoid and GPS calibration parameters
+        Combine ellipsoid, static and GPS calibration parameters
         
         Returns:
             Combined calibration parameters
         """
-        if self.ellipsoid_params is None:
-            return self.gps_cal_params
-            
-        if self.gps_cal_params is None:
-            return self.ellipsoid_params
-            
-        # For now, we'll just use both separately - ellipsoid for hard/soft iron,
-        # and GPS for final heading adjustment
-        combined = {
-            'ellipsoid': self.ellipsoid_params,
-            'gps': self.gps_cal_params,
-            'method': 'combined'
-        }
+        combined = {}
         
+        if self.use_ellipsoid_fit and self.ellipsoid_params is not None:
+            combined['ellipsoid'] = self.ellipsoid_params
+        
+        if self.use_static_calibration and self.static_cal_params is not None:
+            combined['static'] = self.static_cal_params
+        
+        if self.use_gps_calibration and self.gps_cal_params is not None:
+            combined['gps'] = self.gps_cal_params
+        
+        combined['method'] = 'combined'
         return combined
     
     def _apply_calibration(self, data):
@@ -831,18 +1284,42 @@ class CompassCalibrator:
         Returns:
             List of dictionaries with keys 'timestamp' and 'heading'
         """
-        if self.calibration_params is None:
-            raise ValueError("Calibration must be performed before applying it")
+        if (not self.use_ellipsoid_fit and not self.use_gps_calibration and 
+            not self.use_static_calibration):
+            print("Warning: No calibration method enabled, using raw magnetometer data")
         
         calibrated_headings = []
         
         for entry in data:
-            # Apply ellipsoid calibration first
-            if 'ellipsoid' in self.calibration_params:
-                offset_x = self.calibration_params['ellipsoid']['offset_x']
-                offset_y = self.calibration_params['ellipsoid']['offset_y']
-                offset_z = self.calibration_params['ellipsoid']['offset_z']
-                transform = np.array(self.calibration_params['ellipsoid']['transform'])
+            # Apply static calibration if enabled
+            if self.use_static_calibration and self.static_cal_params is not None:
+                offset_x = self.static_cal_params['offset_x']
+                offset_y = self.static_cal_params['offset_y']
+                offset_z = self.static_cal_params['offset_z']
+                scale_x = self.static_cal_params['scale_x']
+                scale_y = self.static_cal_params['scale_y']
+                scale_z = self.static_cal_params['scale_z']
+                
+                # Apply hard iron correction (offset)
+                x_centered = entry['mag_x'] - offset_x
+                y_centered = entry['mag_y'] - offset_y
+                z_centered = entry['mag_z'] - offset_z
+                
+                # Apply soft iron correction (scale)
+                x_calibrated = x_centered * scale_x
+                y_calibrated = y_centered * scale_y
+                z_calibrated = z_centered * scale_z
+                
+                # Convert to NED frame
+                north = -z_calibrated
+                east = y_calibrated
+                
+            # Apply ellipsoid calibration if enabled
+            elif self.use_ellipsoid_fit and self.ellipsoid_params is not None:
+                offset_x = self.ellipsoid_params['offset_x']
+                offset_y = self.ellipsoid_params['offset_y']
+                offset_z = self.ellipsoid_params['offset_z']
+                transform = np.array(self.ellipsoid_params['transform'])
                 
                 # Apply hard iron correction
                 x_centered = entry['mag_x'] - offset_x
@@ -852,21 +1329,25 @@ class CompassCalibrator:
                 # Apply soft iron correction
                 v = np.array([x_centered, y_centered, z_centered])
                 calibrated_v = transform.dot(v)
-                
+
                 # Convert to NED frame
+                # TODO: what is the correct way to do this?
                 north = -calibrated_v[2]  # North = -Z
                 east = calibrated_v[1]   # East = -Y
+                
             else:
                 # Convert directly to NED frame
+                # TODO: what is the correct way to do this?
                 north = -entry['mag_z']
-                east = -entry['mag_y']
+                east = entry['mag_y']
             
+
             # Calculate heading (clockwise from North)
             heading = math.degrees(math.atan2(east, north))
             heading = (heading + 360) % 360
             
             # Apply GPS scale/offset calibration if available
-            if 'gps' in self.calibration_params:
+            if self.use_gps_calibration and 'gps' in self.calibration_params:
                 scale = self.calibration_params['gps']['scale']
                 offset = self.calibration_params['gps']['offset']
                 sin_amp = self.calibration_params['gps']['sin_amp']
@@ -953,7 +1434,7 @@ class CompassCalibrator:
             # Process noise increases with time
             kf.Q = np.array([
                 [0.1*dt, 0.05*dt],
-                [0.05*dt, 0.1*dtheading]
+                [0.05*dt, 0.1*dt]
             ])
             
             # Predict
@@ -976,7 +1457,6 @@ class CompassCalibrator:
             
             # 2. GPS heading (if available and reliable)
             if ('gps_heading' in entry and 
-                not entry.get('is_interpolated_gps', True) and 
                 entry.get('speed', 0) >= self.min_speed_threshold):
                 gps_heading = entry['gps_heading']
                 # Handle heading wraparound
@@ -1024,11 +1504,11 @@ class CompassCalibrator:
                         if j == 0:  # Magnetometer
                             R[j, j] = 10
                         elif j == 1:  # GPS
-                            R[j, j] = 5
+                            R[j, j] = 10
                         elif j == 2:  # RPM
                             R[j, j] = 20
                     elif H_rows[j][1] == 1:  # Angular velocity measurement
-                        R[j, j] = 15
+                        R[j, j] = 20
                 
                 # Update Kalman filter parameters
                 kf.H = H
@@ -1096,6 +1576,7 @@ class CompassCalibrator:
         return {
             'ellipsoid': self.ellipsoid_params,
             'gps': self.gps_cal_params,
+            'static': self.static_cal_params,
             'combined': self.calibration_params
         }
     
