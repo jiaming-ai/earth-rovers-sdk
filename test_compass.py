@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from clear.data_process.compass import CompassCalibrator
+from clear.data_process.compass_calibration import CompassCalibrator
 import seaborn as sns
 from scipy.spatial import ConvexHull
 import json
@@ -85,6 +85,38 @@ def read_csv_data(file_path, data_type):
     
     return sorted(data, key=lambda x: x['timestamp'])
 
+def get_raw_headings(mag_data):
+    """
+    Calculate raw headings from magnetometer data without any calibration
+    
+    Args:
+        mag_data: List of magnetometer readings
+        
+    Returns:
+        List of dictionaries with timestamps and headings
+    """
+    raw_headings = []
+    
+    for entry in mag_data:
+        # Convert directly to NED frame (North-East-Down)
+        # According to the schema in the original code:
+        # - Positive X = Vertical Up
+        # - Positive Y = West
+        # - Positive Z = South
+        north = -entry['z']  # North is opposite of South (Z)
+        east = -entry['y']   # East is opposite of West (Y)
+        
+        # Calculate heading (clockwise from North)
+        heading = math.degrees(math.atan2(east, north))
+        heading = (heading + 360) % 360
+        
+        raw_headings.append({
+            'timestamp': entry['timestamp'],
+            'heading': heading
+        })
+    
+    return raw_headings
+
 def compare_calibration_methods(gps_csv, imu_csv, rpm_csv, output_dir='./output',
                               wheel_diameter=130, wheel_base=200):
     """
@@ -115,103 +147,143 @@ def compare_calibration_methods(gps_csv, imu_csv, rpm_csv, output_dir='./output'
     # Initialize results dictionary
     results = {}
     
-    # 1. Ellipsoid fitting only
-    print("\nMethod 1: Ellipsoid fitting only...")
-    try:
-        calibrator1 = CompassCalibrator(use_kalman_filter=False, 
-                                      wheel_diameter=wheel_diameter, 
-                                      wheel_base=wheel_base)
-        
-        # Run ellipsoid-only calibration
-        ellipsoid_headings = run_ellipsoid_only_calibration(calibrator1, mag_data, gps_data)
-        ellipsoid_metrics = calibrator1.get_validation_metrics()
-        
-        results['Ellipsoid Only'] = {
-            'headings': ellipsoid_headings,
-            'metrics': ellipsoid_metrics,
-            'params': calibrator1.get_calibration_params()
+    # Define all calibration methods to test
+    calibration_methods = [
+        {
+            'name': 'Raw Heading (No Calibration)',
+            'use_ellipsoid_fit': False,
+            'use_gps_calibration': False,
+            'use_static_calibration': False,
+            'use_kalman_filter': False
+        },
+        {
+            'name': 'Static Calibration Only',
+            'use_ellipsoid_fit': False,
+            'use_gps_calibration': False,
+            'use_static_calibration': True,
+            'use_kalman_filter': False
+        },
+        {
+            'name': 'Ellipsoid Fitting Only',
+            'use_ellipsoid_fit': True,
+            'use_gps_calibration': False,
+            'use_static_calibration': False,
+            'use_kalman_filter': False
+        },
+        {
+            'name': 'GPS Calibration Only',
+            'use_ellipsoid_fit': False,
+            'use_gps_calibration': True,
+            'use_static_calibration': False,
+            'use_kalman_filter': False
+        },
+        {
+            'name': 'Ellipsoid + GPS',
+            'use_ellipsoid_fit': True,
+            'use_gps_calibration': True,
+            'use_static_calibration': False,
+            'use_kalman_filter': False
+        },
+        {
+            'name': 'GPS + Static',
+            'use_ellipsoid_fit': False,
+            'use_gps_calibration': True,
+            'use_static_calibration': True,
+            'use_kalman_filter': False
+        },
+        {
+            'name': 'Ellipsoid + GPS + Kalman',
+            'use_ellipsoid_fit': True,
+            'use_gps_calibration': True,
+            'use_static_calibration': False,
+            'use_kalman_filter': True
+        },
+        {
+            'name': 'GPS + Static + Kalman',
+            'use_ellipsoid_fit': False,
+            'use_gps_calibration': True,
+            'use_static_calibration': True,
+            'use_kalman_filter': True
+        },
+        {
+            'name': 'Ellipsoid + Kalman',
+            'use_ellipsoid_fit': True,
+            'use_gps_calibration': False,
+            'use_static_calibration': False,
+            'use_kalman_filter': True
+        },
+        {
+            'name': 'GPS + Kalman',
+            'use_ellipsoid_fit': False,
+            'use_gps_calibration': True,
+            'use_static_calibration': False,
+            'use_kalman_filter': True
         }
-    except Exception as e:
-        print(f"Error in Ellipsoid calibration: {e}")
-        # Add placeholder results
-        results['Ellipsoid Only'] = {
-            'headings': [],
-            'metrics': {'error_count': 0, 'mean_error': float('nan'), 'max_error': float('nan')},
-            'params': {'ellipsoid': None, 'gps': None, 'combined': None}
-        }
+    ]
     
-    # 2. GPS calibration without Kalman filter
-    print("\nMethod 2: GPS calibration without Kalman filter...")
-    try:
-        calibrator2 = CompassCalibrator(use_kalman_filter=False, 
-                                      wheel_diameter=wheel_diameter, 
-                                      wheel_base=wheel_base)
-        gps_headings = calibrator2.calibrate(gps_data, mag_data, None)
-        gps_metrics = calibrator2.get_validation_metrics()
+    # Process each calibration method
+    for method in calibration_methods:
+        method_name = method['name']
+        print(f"\nMethod: {method_name}")
         
-        results['GPS (No Kalman)'] = {
-            'headings': gps_headings,
-            'metrics': gps_metrics,
-            'params': calibrator2.get_calibration_params()
-        }
-    except Exception as e:
-        print(f"Error in GPS calibration without Kalman: {e}")
-        results['GPS (No Kalman)'] = {
-            'headings': [],
-            'metrics': {'error_count': 0, 'mean_error': float('nan'), 'max_error': float('nan')},
-            'params': {'ellipsoid': None, 'gps': None, 'combined': None}
-        }
-    
-    # 3. GPS calibration with Kalman filter
-    print("\nMethod 3: GPS calibration with Kalman filter...")
-    try:
-        calibrator3 = CompassCalibrator(use_kalman_filter=True, 
-                                      wheel_diameter=wheel_diameter, 
-                                      wheel_base=wheel_base)
-        gps_kalman_headings = calibrator3.calibrate(gps_data, mag_data, None)
-        gps_kalman_metrics = calibrator3.get_validation_metrics()
-        
-        results['GPS with Kalman'] = {
-            'headings': gps_kalman_headings,
-            'metrics': gps_kalman_metrics,
-            'params': calibrator3.get_calibration_params()
-        }
-    except Exception as e:
-        print(f"Error in GPS calibration with Kalman: {e}")
-        results['GPS with Kalman'] = {
-            'headings': [],
-            'metrics': {'error_count': 0, 'mean_error': float('nan'), 'max_error': float('nan')},
-            'params': {'ellipsoid': None, 'gps': None, 'combined': None}
-        }
-    
-    # 4. RPM with Kalman filter
-    print("\nMethod 4: GPS+RPM with Kalman filter...")
-    try:
-        calibrator4 = CompassCalibrator(use_kalman_filter=True, 
-                                      wheel_diameter=wheel_diameter, 
-                                      wheel_base=wheel_base)
-        rpm_kalman_headings = calibrator4.calibrate(gps_data, mag_data, rpm_data)
-        rpm_kalman_metrics = calibrator4.get_validation_metrics()
-        
-        results['GPS+RPM with Kalman'] = {
-            'headings': rpm_kalman_headings,
-            'metrics': rpm_kalman_metrics,
-            'params': calibrator4.get_calibration_params()
-        }
-    except Exception as e:
-        print(f"Error in GPS+RPM calibration with Kalman: {e}")
-        results['GPS+RPM with Kalman'] = {
-            'headings': [],
-            'metrics': {'error_count': 0, 'mean_error': float('nan'), 'max_error': float('nan')},
-            'params': {'ellipsoid': None, 'gps': None, 'combined': None}
-        }
+        try:
+            # Create calibrator with specified parameters
+            calibrator = CompassCalibrator(
+                use_ellipsoid_fit=method['use_ellipsoid_fit'],
+                use_gps_calibration=method['use_gps_calibration'],
+                use_static_calibration=method['use_static_calibration'],
+                use_kalman_filter=method['use_kalman_filter'],
+                wheel_diameter=wheel_diameter,
+                wheel_base=wheel_base
+            )
+            
+            # Special case for raw heading (no calibration)
+            if method_name == 'Raw Heading (No Calibration)':
+                headings = get_raw_headings(mag_data)
+                # Calculate validation metrics against GPS
+                aligned_data = calibrator._align_timestamps(gps_data, mag_data, None)
+                metrics = calibrator._validate_calibration(aligned_data, headings)
+            else:
+                # Standard calibration process
+                headings = calibrator.calibrate(gps_data, mag_data, rpm_data)
+                metrics = calibrator.get_validation_metrics()
+            
+            # Store results
+            results[method_name] = {
+                'headings': headings,
+                'metrics': metrics,
+                'params': calibrator.get_calibration_params() if hasattr(calibrator, 'calibration_params') else None
+            }
+            
+        except Exception as e:
+            print(f"Error in {method_name} calibration: {e}")
+            # Add placeholder results
+            results[method_name] = {
+                'headings': [],
+                'metrics': {'error_count': 0, 'mean_error': float('nan'), 'max_error': float('nan')},
+                'params': None
+            }
     
     # Generate visualizations and comparison metrics
     print("\nGenerating visualizations and comparison metrics...")
     
     # 1. Visualize magnetometer data before and after calibration
     try:
-        visualize_magnetometer_data(mag_data, calibrator1, os.path.join(output_dir, "magnetometer_calibration.png"))
+        # Use ellipsoid fitting results for visualization
+        ellipsoid_method = [m for m in calibration_methods if m['use_ellipsoid_fit'] and 
+                          not m['use_gps_calibration'] and 
+                          not m['use_static_calibration'] and
+                          not m['use_kalman_filter']]
+        
+        if ellipsoid_method and ellipsoid_method[0]['name'] in results:
+            calibrator_for_viz = CompassCalibrator(
+                use_ellipsoid_fit=True,
+                use_gps_calibration=False,
+                use_static_calibration=False,
+                use_kalman_filter=False
+            )
+            calibrator_for_viz.ellipsoid_params = calibrator_for_viz._perform_ellipsoid_fitting(mag_data)
+            visualize_magnetometer_data(mag_data, calibrator_for_viz, os.path.join(output_dir, "magnetometer_calibration.png"))
     except Exception as e:
         print(f"Error visualizing magnetometer data: {e}")
     
@@ -253,95 +325,6 @@ def compare_calibration_methods(gps_csv, imu_csv, rpm_csv, output_dir='./output'
     print(f"\nResults saved to {output_dir}")
     
     return results
-
-def run_ellipsoid_only_calibration(calibrator, mag_data, gps_data):
-    """
-    Run ellipsoid-only calibration
-    
-    Args:
-        calibrator: CompassCalibrator instance
-        mag_data: Magnetometer data
-        gps_data: GPS data for validation
-    
-    Returns:
-        Calibrated headings
-    """
-    # First perform ellipsoid fitting
-    try:
-        ellipsoid_params = calibrator._perform_ellipsoid_fitting(mag_data)
-        calibrator.ellipsoid_params = ellipsoid_params
-        calibrator.calibration_params = ellipsoid_params
-        
-        # Check if we got a valid result (method will be 'identity' if fitting failed)
-        if ellipsoid_params.get('method') == 'identity':
-            print("Warning: Ellipsoid fitting returned default identity parameters.")
-    except Exception as e:
-        print(f"Error during ellipsoid fitting: {e}")
-        print("Using identity transformation as fallback.")
-        # Create default parameters
-        calibrator.ellipsoid_params = {
-            'offset_x': 0.0,
-            'offset_y': 0.0,
-            'offset_z': 0.0,
-            'transform': np.eye(3).tolist(),
-            'method': 'identity_fallback'
-        }
-    
-    # Apply calibration manually
-    calibrated_headings = []
-    
-    # If we don't have valid ellipsoid parameters, just use raw data
-    if calibrator.ellipsoid_params is None:
-        print("Warning: No ellipsoid parameters available. Using uncalibrated headings.")
-        for entry in mag_data:
-            # Convert directly to NED frame from uncalibrated data
-            north = -entry['z']  # Convert Z (South) to North
-            east = -entry['y']   # Convert Y (West) to East
-            
-            # Calculate heading
-            heading = math.degrees(math.atan2(east, north))
-            heading = (heading + 360) % 360
-            
-            calibrated_headings.append({
-                'timestamp': entry['timestamp'],
-                'heading': heading
-            })
-    else:
-        # Normal calibration with available parameters
-        for entry in mag_data:
-            # Get parameters
-            offset_x = calibrator.ellipsoid_params['offset_x']
-            offset_y = calibrator.ellipsoid_params['offset_y']
-            offset_z = calibrator.ellipsoid_params['offset_z']
-            transform = np.array(calibrator.ellipsoid_params['transform'])
-            
-            # Center data (hard iron correction)
-            x_centered = entry['x'] - offset_x
-            y_centered = entry['y'] - offset_y
-            z_centered = entry['z'] - offset_z
-            
-            # Apply transform (soft iron correction)
-            v = np.array([x_centered, y_centered, z_centered])
-            calibrated_v = transform.dot(v)
-            
-            # Convert to NED frame
-            north = -calibrated_v[2]  # Convert Z (South) to North
-            east = -calibrated_v[1]   # Convert Y (West) to East
-            
-            # Calculate heading
-            heading = math.degrees(math.atan2(east, north))
-            heading = (heading + 360) % 360
-            
-            calibrated_headings.append({
-                'timestamp': entry['timestamp'],
-                'heading': heading
-            })
-    
-    # Calculate validation metrics
-    aligned_data = calibrator._align_timestamps(gps_data, mag_data, None)
-    calibrator.validation_metrics = calibrator._validate_calibration(aligned_data, calibrated_headings)
-    
-    return calibrated_headings
 
 def visualize_magnetometer_data(mag_data, calibrator, output_path):
     """
@@ -624,7 +607,7 @@ def visualize_headings(gps_data, heading_data, output_path, title="Compass Headi
     # Save figure
     plt.savefig(output_path, dpi=300)
     plt.close()
-    
+
 def create_combined_visualization(gps_data, results, output_path):
     """
     Create a combined visualization of all calibration methods
@@ -634,7 +617,28 @@ def create_combined_visualization(gps_data, results, output_path):
         results: Dictionary with results for each method
         output_path: Path to save the output image
     """
-    # Create figure with subplots
+    # Limit the number of methods to show to avoid overcrowding
+    # Prioritize showing the most interesting methods
+    priority_methods = [
+        'Raw Heading (No Calibration)',
+        'Ellipsoid Fitting Only',
+        'Ellipsoid + GPS',
+        'Ellipsoid + GPS + Kalman'
+    ]
+    
+    # Filter results to include only priority methods that exist
+    filtered_results = {}
+    for method in priority_methods:
+        if method in results:
+            filtered_results[method] = results[method]
+    
+    # If we don't have enough priority methods, add others
+    if len(filtered_results) < 4:
+        for method, result in results.items():
+            if method not in filtered_results and len(filtered_results) < 4:
+                filtered_results[method] = result
+    
+    # Create figure with subplots (2x2 grid)
     fig = plt.figure(figsize=(15, 12))
     gs = GridSpec(2, 2, figure=fig)
     
@@ -647,7 +651,11 @@ def create_combined_visualization(gps_data, results, output_path):
              for entry in gps_data}
     
     # Process each method
-    for i, (method_name, method_results) in enumerate(results.items()):
+    for i, (method_name, method_results) in enumerate(filtered_results.items()):
+        # Skip if we have more than 4 methods (shouldn't happen with our filtering)
+        if i >= 4:
+            break
+            
         # Determine subplot position
         row = i // 2
         col = i % 2
@@ -699,7 +707,9 @@ def create_combined_visualization(gps_data, results, output_path):
         
         # Get metrics
         metrics = method_results['metrics']
-        metrics_text = f"Mean Error: {metrics.get('mean_error', 'N/A'):.2f}°"
+        mean_error = metrics.get('mean_error', float('nan'))
+        mean_str = f"{mean_error:.2f}°" if not math.isnan(mean_error) else "N/A"
+        metrics_text = f"Mean Error: {mean_str}"
         
         # Set subplot title
         ax.set_title(f"{method_name}\n{metrics_text}")
@@ -800,8 +810,8 @@ def create_metrics_comparison(results, output_path):
     
     plt.legend(title='Metric')
     
-    # Rotate x-axis labels if needed
-    plt.xticks(rotation=15)
+    # Rotate x-axis labels for better readability
+    plt.xticks(rotation=30, ha='right')
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)

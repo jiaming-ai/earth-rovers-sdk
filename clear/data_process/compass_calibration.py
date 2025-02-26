@@ -5,6 +5,8 @@ from scipy.linalg import eigh
 from filterpy.kalman import KalmanFilter
 import matplotlib.pyplot as plt
 import utm
+import scipy
+import geomag
 
 USE_NED = True
 def visualize_headings(
@@ -391,14 +393,14 @@ class CompassCalibrator:
             # Calculate calibration parameters
             try:
                 # Get the inverse of M
-                M_1 = np.linalg.inv(M)
+                M_1 = scipy.linalg.inv(M)
                 
                 # Calculate the offset (hard iron bias)
                 offset = -np.dot(M_1, n)
                 
                 # Calculate the transformation matrix (soft iron correction)
                 # Note: F is already in raw LSB units matching the sensor data
-                transform = np.real(F / np.sqrt(np.dot(n.T, np.dot(M_1, n)) - d) * np.linalg.sqrtm(M))
+                transform = np.real(F / np.sqrt(np.dot(n.T, np.dot(M_1, n)) - d) * scipy.linalg.sqrtm(M))
                 
                 return {
                     'offset_x': float(offset[0]),
@@ -408,7 +410,7 @@ class CompassCalibrator:
                     'method': 'ellipsoid',
                     'field_strength': float(F)
                 }
-            except np.linalg.LinAlgError as e:
+            except scipy.linalg.LinAlgError as e:
                 print(f"Matrix inversion error: {e}")
                 return {
                     'offset_x': 0.0,
@@ -430,7 +432,7 @@ class CompassCalibrator:
                 'field_strength': 1000.0  # Default field strength
             }
 
-    def _get_field_strength(self, gps_data, gain=1090):
+    def _get_field_strength(self, gps_data, gain=3000):
         """
         Get the expected magnetic field strength in raw LSB units
         
@@ -467,11 +469,10 @@ class CompassCalibrator:
             
             # Use geomag to get the field strength
             try:
-                import geomag
-                geo_mag = geomag.GeoMag()
+                geo_mag = geomag.geomag.GeoMag()
                 result = geo_mag.GeoMag(latitude, longitude, altitude)
-                total_field_nT = result.total
-                
+                total_field_nT = result.ti
+
                 # Convert nT to Gauss
                 total_field_gauss = total_field_nT * 1e-5
                 
@@ -524,16 +525,16 @@ class CompassCalibrator:
                     [ 0,  0,  0,  0,  0, -4]])
 
         # v_1 (eq. 15, solution)
-        E = np.dot(np.linalg.inv(C),
-                S_11 - np.dot(S_12, np.dot(np.linalg.inv(S_22), S_21)))
+        E = np.dot(scipy.linalg.inv(C),
+                S_11 - np.dot(S_12, np.dot(scipy.linalg.inv(S_22), S_21)))
 
-        E_w, E_v = np.linalg.eig(E)
+        E_w, E_v = scipy.linalg.eig(E)
 
         v_1 = E_v[:, np.argmax(E_w)]
         if v_1[0] < 0: v_1 = -v_1
 
         # v_2 (eq. 13, solution)
-        v_2 = np.dot(np.dot(-np.linalg.inv(S_22), S_21), v_1)
+        v_2 = np.dot(np.dot(-scipy.linalg.inv(S_22), S_21), v_1)
 
         # quadratic-form parameters, parameters h and f swapped as per correction 
         M = np.array([[v_1[0], v_1[5], v_1[4]],
