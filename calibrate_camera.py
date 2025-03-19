@@ -412,7 +412,7 @@ def collect_images(num_images=40, save_folder='calibration_images', pattern_size
 def main():
     # Define parameters
     image_folder = 'calibration_images'  # Folder containing checkerboard images
-    pattern_size = (9, 6)  # Number of inner corners in the checkerboard pattern
+    pattern_size = (8,6) # (9, 6)  # Number of inner corners in the checkerboard pattern
     square_size = 2.8  # Size of each square in cm (adjust as needed)
     
     # Create output directory
